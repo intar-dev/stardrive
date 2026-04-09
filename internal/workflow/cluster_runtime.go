@@ -4,21 +4,30 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/apricote/hcloud-upload-image/hcloudimages"
+	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/intar-dev/stardrive/internal/config"
 	"github.com/intar-dev/stardrive/internal/hetzner"
 	"github.com/intar-dev/stardrive/internal/infisical"
 	"github.com/intar-dev/stardrive/internal/names"
 	"github.com/intar-dev/stardrive/internal/talos"
+	"github.com/siderolabs/talos/pkg/cluster"
+	"github.com/siderolabs/talos/pkg/cluster/check"
+	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
+	clusterres "github.com/siderolabs/talos/pkg/machinery/resources/cluster"
+	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/tools/clientcmd"
@@ -31,6 +40,10 @@ const (
 	fluxRegistryCASecret     = "stardrive-registry-ca"
 	hetznerCloudSecretName   = "hcloud"
 	registryBootstrapPVName  = "storagebox-registry"
+	publicEdgeNamespace      = "gateway-system"
+	publicGatewayName        = "stardrive-public"
+	publicWildcardCertName   = "stardrive-wildcard"
+	publicWildcardTLSSecret  = "stardrive-wildcard-tls"
 	resourceManagedByKey     = "stardrive.dev-managed-by"
 	resourceManagedByValue   = "stardrive"
 	resourceClusterKey       = "stardrive.dev-cluster"
@@ -38,6 +51,7 @@ const (
 	resourceImageIDKey       = "stardrive.dev-image-id"
 	resourceRepositoryPrefix = "gitops"
 	hetznerUserDataByteLimit = 32 * 1024
+	gatewayAPIVersion        = "v1.4.1"
 )
 
 type inlineManifest struct {
@@ -262,24 +276,16 @@ func (a *App) ensureHetznerNetworking(ctx context.Context, cfg *config.Config, h
 	if err != nil {
 		return runtimeSecrets{}, err
 	}
-	loadBalancer, err := hzClient.EnsureLoadBalancer(ctx, clusterResourceName(cfg, "api-lb"), cfg.Hetzner.LoadBalancerType, cfg.Hetzner.Location, network)
-	if err != nil {
-		return runtimeSecrets{}, err
-	}
 
 	runtime := runtimeSecrets{
 		NetworkID:        network.ID,
 		PlacementGroupID: placementGroup.ID,
 		FirewallID:       firewall.ID,
-		LoadBalancerID:   loadBalancer.ID,
-		LoadBalancerIPv4: strings.TrimSpace(loadBalancer.PublicNet.IPv4.IP.String()),
 	}
 	if err := infClient.SetSecrets(ctx, cfg.Infisical.ProjectID, cfg.Infisical.Environment, cfg.Secrets().ClusterRuntime, map[string]string{
 		secretHetznerNetworkID:        fmt.Sprintf("%d", runtime.NetworkID),
 		secretHetznerPlacementGroupID: fmt.Sprintf("%d", runtime.PlacementGroupID),
 		secretHetznerFirewallID:       fmt.Sprintf("%d", runtime.FirewallID),
-		secretHetznerLoadBalancerID:   fmt.Sprintf("%d", runtime.LoadBalancerID),
-		secretHetznerLoadBalancerIPv4: runtime.LoadBalancerIPv4,
 	}); err != nil {
 		return runtimeSecrets{}, err
 	}
@@ -299,10 +305,6 @@ func (a *App) ensureClusterServers(ctx context.Context, cfg *config.Config, hzCl
 	if err != nil {
 		return err
 	}
-	loadBalancer, err := hzClient.EnsureLoadBalancer(ctx, clusterResourceName(cfg, "api-lb"), cfg.Hetzner.LoadBalancerType, cfg.Hetzner.Location, network)
-	if err != nil {
-		return err
-	}
 
 	existing, err := hzClient.ListServers(ctx, clusterResourceLabels(cfg))
 	if err != nil {
@@ -318,53 +320,91 @@ func (a *App) ensureClusterServers(ctx context.Context, cfg *config.Config, hzCl
 	for i := range cfg.Nodes {
 		node := &cfg.Nodes[i]
 		if existingServer, ok := byNode[node.Name]; ok {
-			node.ServerID = existingServer.ID
-			node.InstanceID = existingServer.ID
-			node.PublicIPv4 = existingServer.PublicIPv4
-			if strings.TrimSpace(existingServer.PrivateIPv4) != "" {
-				node.PrivateIPv4 = existingServer.PrivateIPv4
+			reconciled, err := a.reconcileExistingServer(ctx, cfg, hzClient, existingServer, *node, network.ID, placementGroup.ID, firewall.ID)
+			if err != nil {
+				return err
 			}
-			node.PublicIPv6 = existingServer.PublicIPv6
+			byNode[node.Name] = reconciled
+			node.ServerID = reconciled.ID
+			node.InstanceID = reconciled.ID
+			node.PublicIPv4 = reconciled.PublicIPv4
+			if strings.TrimSpace(reconciled.PrivateIPv4) != "" {
+				node.PrivateIPv4 = reconciled.PrivateIPv4
+			}
+			node.PublicIPv6 = reconciled.PublicIPv6
+		}
+	}
+
+	type pendingServer struct {
+		index    int
+		node     config.NodeConfig
+		userData string
+	}
+
+	pending := make([]pendingServer, 0, len(cfg.Nodes))
+	for i := range cfg.Nodes {
+		node := cfg.Nodes[i]
+		if _, ok := byNode[node.Name]; ok {
 			continue
 		}
-
 		userData, ok := renderedConfigs[node.Name]
 		if !ok {
 			return fmt.Errorf("rendered Talos config for node %s is missing", node.Name)
 		}
-		created, err := hzClient.CreateServer(ctx, hetzner.ServerCreateRequest{
-			Name:           node.Name,
-			ServerType:     cfg.Hetzner.ServerType,
-			Location:       cfg.Hetzner.Location,
-			ImageID:        runtime.BootImageID,
-			UserData:       string(userData),
-			PrivateIPv4:    node.PrivateIPv4,
-			Network:        network,
-			PlacementGroup: placementGroup,
-			Firewall:       firewall,
-			Labels:         nodeResourceLabels(cfg, *node),
-			PublicIPv6:     cfg.Hetzner.PublicIPv6,
+		pending = append(pending, pendingServer{
+			index:    i,
+			node:     node,
+			userData: string(userData),
 		})
-		if err != nil {
-			return err
-		}
-		node.ServerID = created.ID
-		node.InstanceID = created.ID
-		node.PublicIPv4 = created.PublicIPv4
-		if strings.TrimSpace(created.PrivateIPv4) != "" {
-			node.PrivateIPv4 = created.PrivateIPv4
-		}
-		node.PublicIPv6 = created.PublicIPv6
 	}
 
-	serverIDs := make([]int64, 0, len(cfg.Nodes))
-	for _, node := range cfg.Nodes {
-		if node.ProviderID() > 0 {
-			serverIDs = append(serverIDs, node.ProviderID())
-		}
+	if len(pending) == 0 {
+		return nil
 	}
-	if err := hzClient.SyncLoadBalancerTargetsByID(ctx, loadBalancer.ID, serverIDs); err != nil {
+
+	created := make([]*hetzner.Server, len(cfg.Nodes))
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(parallelNodeLimit(len(pending)))
+	for _, request := range pending {
+		request := request
+		group.Go(func() error {
+			server, err := hzClient.CreateServer(groupCtx, hetzner.ServerCreateRequest{
+				Name:           request.node.Name,
+				ServerType:     cfg.Hetzner.ServerType,
+				Location:       cfg.Hetzner.Location,
+				ImageID:        runtime.BootImageID,
+				UserData:       request.userData,
+				PrivateIPv4:    request.node.PrivateIPv4,
+				Network:        network,
+				PlacementGroup: placementGroup,
+				Firewall:       firewall,
+				Labels:         nodeResourceLabels(cfg, request.node),
+				PublicIPv6:     cfg.Hetzner.PublicIPv6,
+			})
+			if err != nil {
+				return err
+			}
+			created[request.index] = server
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
 		return err
+	}
+
+	for _, request := range pending {
+		server := created[request.index]
+		if server == nil {
+			return fmt.Errorf("server creation for node %s returned no result", request.node.Name)
+		}
+		node := &cfg.Nodes[request.index]
+		node.ServerID = server.ID
+		node.InstanceID = server.ID
+		node.PublicIPv4 = server.PublicIPv4
+		if strings.TrimSpace(server.PrivateIPv4) != "" {
+			node.PrivateIPv4 = server.PrivateIPv4
+		}
+		node.PublicIPv6 = server.PublicIPv6
 	}
 	return nil
 }
@@ -382,6 +422,51 @@ func (a *App) waitForTalosSecure(ctx context.Context, nodeAddress string, talosc
 	})
 }
 
+func (a *App) reconcileExistingServer(ctx context.Context, cfg *config.Config, hzClient *hetzner.Client, existing hetzner.Server, node config.NodeConfig, networkID, placementGroupID, firewallID int64) (hetzner.Server, error) {
+	if strings.TrimSpace(existing.ServerType) != strings.TrimSpace(cfg.Hetzner.ServerType) {
+		return hetzner.Server{}, fmt.Errorf("existing server %s has server type %s, expected %s", node.Name, existing.ServerType, cfg.Hetzner.ServerType)
+	}
+	if strings.TrimSpace(existing.Location) != strings.TrimSpace(cfg.Hetzner.Location) {
+		return hetzner.Server{}, fmt.Errorf("existing server %s is in location %s, expected %s", node.Name, existing.Location, cfg.Hetzner.Location)
+	}
+
+	if placementGroupID != 0 {
+		reconciled, reconcileErr := hzClient.EnsureServerInPlacementGroup(ctx, existing.ID, placementGroupID)
+		if reconcileErr != nil {
+			return hetzner.Server{}, fmt.Errorf("ensure placement group for server %s: %w", node.Name, reconcileErr)
+		}
+		existing = *reconciled
+	}
+	if networkID != 0 {
+		reconciled, reconcileErr := hzClient.EnsureServerAttachedToNetwork(ctx, existing.ID, networkID, node.PrivateIPv4)
+		if reconcileErr != nil {
+			return hetzner.Server{}, fmt.Errorf("ensure private network for server %s: %w", node.Name, reconcileErr)
+		}
+		existing = *reconciled
+	}
+	if firewallID != 0 {
+		reconciled, reconcileErr := hzClient.EnsureFirewallAppliedToServer(ctx, firewallID, existing.ID)
+		if reconcileErr != nil {
+			return hetzner.Server{}, fmt.Errorf("ensure firewall for server %s: %w", node.Name, reconcileErr)
+		}
+		existing = *reconciled
+	}
+
+	if placementGroupID != 0 && existing.PlacementGroupID != placementGroupID {
+		return hetzner.Server{}, fmt.Errorf("existing server %s is attached to placement group %d, expected %d", node.Name, existing.PlacementGroupID, placementGroupID)
+	}
+	if networkID != 0 && !slices.Contains(existing.NetworkIDs, networkID) {
+		return hetzner.Server{}, fmt.Errorf("existing server %s is not attached to required network %d", node.Name, networkID)
+	}
+	if firewallID != 0 && !slices.Contains(existing.FirewallIDs, firewallID) {
+		return hetzner.Server{}, fmt.Errorf("existing server %s is not attached to required firewall %d", node.Name, firewallID)
+	}
+	if wantIP := strings.TrimSpace(node.PrivateIPv4); wantIP != "" && strings.TrimSpace(existing.PrivateIPv4) != wantIP {
+		return hetzner.Server{}, fmt.Errorf("existing server %s has private IPv4 %s, expected %s", node.Name, existing.PrivateIPv4, wantIP)
+	}
+	return existing, nil
+}
+
 func (a *App) fetchKubeconfig(ctx context.Context, nodeAddress string, talosconfig []byte) ([]byte, error) {
 	client, err := talos.NewClient(nodeAddress, talosconfig)
 	if err != nil {
@@ -389,49 +474,6 @@ func (a *App) fetchKubeconfig(ctx context.Context, nodeAddress string, talosconf
 	}
 	defer client.Close()
 	return client.Kubeconfig(ctx)
-}
-
-func (a *App) waitForLoadBalancerTargets(ctx context.Context, cfg *config.Config, hzClient *hetzner.Client, runtime runtimeSecrets) error {
-	if hzClient == nil || runtime.LoadBalancerID == 0 {
-		return nil
-	}
-
-	serverIDs := make([]int64, 0, len(cfg.Nodes))
-	for _, node := range cfg.Nodes {
-		if id := node.ProviderID(); id > 0 {
-			serverIDs = append(serverIDs, id)
-		}
-	}
-	if len(serverIDs) == 0 {
-		return nil
-	}
-
-	a.logInfo("waiting for Hetzner load balancer targets",
-		"cluster", cfg.Cluster.Name,
-		"load_balancer_id", runtime.LoadBalancerID,
-		"targets", len(serverIDs),
-		"port", 6443,
-		"timeout", time.Until(deadlineOrNow(ctx)).String(),
-	)
-	lastSummary := ""
-	return waitFor(ctx, 5*time.Second, func(ctx context.Context) error {
-		ready, summary, err := hzClient.LoadBalancerTargetsHealthy(ctx, runtime.LoadBalancerID, serverIDs, 6443)
-		if err != nil {
-			return err
-		}
-		if summary != "" && summary != lastSummary {
-			a.logInfo("load balancer target status",
-				"cluster", cfg.Cluster.Name,
-				"load_balancer_id", runtime.LoadBalancerID,
-				"status", summary,
-			)
-			lastSummary = summary
-		}
-		if !ready {
-			return fmt.Errorf("load balancer targets are not ready")
-		}
-		return nil
-	})
 }
 
 func (a *App) waitForKubernetesAPI(ctx context.Context, cfg *config.Config, kubeconfigPath string) error {
@@ -477,22 +519,64 @@ func (a *App) persistKubeconfig(ctx context.Context, cfg *config.Config, infClie
 }
 
 func (a *App) verifyTalosHealth(ctx context.Context, cfg *config.Config, talosconfig []byte) error {
-	endpoint := firstControlPlaneIP(cfg)
-	if endpoint == "" {
-		return fmt.Errorf("no control-plane public IPv4 addresses are available")
-	}
-	controlPlaneNodes := controlPlaneHealthIPs(cfg)
-	if len(controlPlaneNodes) == 0 {
-		return fmt.Errorf("no control-plane node IPs are available for health checks")
-	}
-	kubernetesEndpoint := endpoint
-	client, err := talos.NewClient(endpoint, talosconfig)
+	endpoint, err := a.firstReachableControlPlaneIP(ctx, cfg, talosconfig)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
-	a.logInfo("verifying Talos cluster health", "endpoint", endpoint, "kubernetes_endpoint", kubernetesEndpoint, "control_plane_nodes", controlPlaneNodes)
-	return client.HealthCheck(ctx, 15*time.Minute, controlPlaneNodes, nil, kubernetesEndpoint)
+	kubernetesEndpoint := strings.TrimSpace(cfg.DNS.APIHostname)
+	if kubernetesEndpoint == "" {
+		kubernetesEndpoint = endpoint
+	}
+	cfgBytes := bytes.TrimSpace(talosconfig)
+	if len(cfgBytes) == 0 {
+		return fmt.Errorf("talosconfig is missing")
+	}
+	parsedTalosconfig, err := clientconfig.FromBytes(cfgBytes)
+	if err != nil {
+		return fmt.Errorf("parse talosconfig: %w", err)
+	}
+	clientProvider := &cluster.ConfigClientProvider{TalosConfig: parsedTalosconfig}
+	defaultClient, err := clientProvider.Client(endpoint)
+	if err != nil {
+		return fmt.Errorf("create Talos health client: %w", err)
+	}
+	clientProvider.DefaultClient = defaultClient
+	defer clientProvider.Close() //nolint:errcheck
+
+	items, err := safe.StateListAll[*clusterres.Member](ctx, defaultClient.COSI)
+	if err != nil {
+		return fmt.Errorf("discover Talos cluster members: %w", err)
+	}
+	var members []*clusterres.Member
+	items.ForEach(func(item *clusterres.Member) {
+		members = append(members, item)
+	})
+	if len(members) == 0 {
+		return fmt.Errorf("no Talos cluster members discovered")
+	}
+
+	clusterInfo, err := check.NewDiscoveredClusterInfo(members)
+	if err != nil {
+		return fmt.Errorf("build Talos cluster info: %w", err)
+	}
+
+	state := struct {
+		cluster.ClientProvider
+		cluster.K8sProvider
+		cluster.Info
+	}{
+		ClientProvider: clientProvider,
+		K8sProvider: &cluster.KubernetesClient{
+			ClientProvider: clientProvider,
+			ForceEndpoint:  kubernetesEndpoint,
+		},
+		Info: clusterInfo,
+	}
+
+	checkCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+	a.logInfo("verifying Talos cluster health", "endpoint", endpoint, "kubernetes_endpoint", kubernetesEndpoint, "mode", "client-side")
+	return check.Wait(checkCtx, &state, append(check.DefaultClusterChecks(), check.ExtraClusterChecks()...), check.StderrReporter())
 }
 
 func (a *App) installCilium(ctx context.Context, cfg *config.Config, kubeconfigPath string) error {
@@ -502,29 +586,67 @@ func (a *App) installCilium(ctx context.Context, cfg *config.Config, kubeconfigP
 		return err
 	}
 	env := a.kubectlEnv(kubeconfigPath)
+	if err := a.installGatewayAPICRDs(ctx, kubeconfigPath); err != nil {
+		return err
+	}
 	statusCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	installMode := "install"
 	if _, err := a.probeCommand(statusCtx, env, nil, ciliumBinary, "status", "--wait-duration", "30s"); err == nil {
-		a.logInfo("Cilium is already installed", "cluster", cfg.Cluster.Name)
-		return nil
+		installMode = "upgrade"
+		a.logInfo("reconciling existing Cilium installation", "cluster", cfg.Cluster.Name, "version", cfg.EffectiveCiliumVersion())
+	} else {
+		a.logInfo("Cilium is not installed yet; proceeding with install", "cluster", cfg.Cluster.Name)
 	}
-	a.logInfo("Cilium is not installed yet; proceeding with install", "cluster", cfg.Cluster.Name)
-	args := append([]string{"install", "--version", trimVersionPrefix(cfg.EffectiveCiliumVersion())}, talosCiliumInstallFlags()...)
+	args := append([]string{installMode, "--version", trimVersionPrefix(cfg.EffectiveCiliumVersion())}, talosCiliumInstallFlags()...)
 	args = append(args, "--wait")
 	if err := a.runCommand(ctx, env, nil, ciliumBinary, args...); err != nil {
-		return fmt.Errorf("install Cilium: %w", err)
+		return fmt.Errorf("%s Cilium: %w", installMode, err)
+	}
+	if err := a.runCommand(ctx, env, nil, "kubectl", "rollout", "status", "--namespace", "kube-system", "daemonset/cilium-envoy", "--timeout=15m"); err != nil {
+		return fmt.Errorf("wait for Cilium Envoy daemonset: %w", err)
 	}
 	return a.runCommand(ctx, env, nil, ciliumBinary, "status", "--wait")
+}
+
+func (a *App) installGatewayAPICRDs(ctx context.Context, kubeconfigPath string) error {
+	env := a.kubectlEnv(kubeconfigPath)
+	url := fmt.Sprintf("https://github.com/kubernetes-sigs/gateway-api/releases/download/%s/standard-install.yaml", gatewayAPIVersion)
+	if err := a.runCommand(ctx, env, nil, "kubectl", "apply", "--server-side", "-f", url); err != nil {
+		return fmt.Errorf("install Gateway API CRDs: %w", err)
+	}
+	for _, crd := range []string{
+		"gatewayclasses.gateway.networking.k8s.io",
+		"gateways.gateway.networking.k8s.io",
+		"httproutes.gateway.networking.k8s.io",
+		"referencegrants.gateway.networking.k8s.io",
+		"grpcroutes.gateway.networking.k8s.io",
+		"backendtlspolicies.gateway.networking.k8s.io",
+	} {
+		if err := a.runCommand(ctx, env, nil, "kubectl", "wait", "--for=condition=Established", "crd/"+crd, "--timeout=5m"); err != nil {
+			return fmt.Errorf("wait for Gateway API CRD %s: %w", crd, err)
+		}
+	}
+	return nil
 }
 
 func talosCiliumInstallFlags() []string {
 	return []string{
 		"--set", "ipam.mode=kubernetes",
-		"--set", "kubeProxyReplacement=false",
+		"--set", "kubeProxyReplacement=true",
 		"--set", `securityContext.capabilities.ciliumAgent={CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}`,
 		"--set", `securityContext.capabilities.cleanCiliumState={NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}`,
 		"--set", "cgroup.autoMount.enabled=false",
 		"--set", "cgroup.hostRoot=/sys/fs/cgroup",
+		"--set", "k8sServiceHost=localhost",
+		"--set", "k8sServicePort=7445",
+		"--set", "gatewayAPI.enabled=true",
+		"--set", "gatewayAPI.enableAlpn=true",
+		"--set", "gatewayAPI.enableAppProtocol=true",
+		"--set", "gatewayAPI.hostNetwork.enabled=true",
+		"--set", "envoy.enabled=true",
+		"--set", "envoy.securityContext.capabilities.keepCapNetBindService=true",
+		"--set", `envoy.securityContext.capabilities.envoy={NET_ADMIN,SYS_ADMIN,NET_BIND_SERVICE}`,
 	}
 }
 
@@ -596,18 +718,137 @@ func (a *App) waitForFluxBootstrapOCI(ctx context.Context, cfg *config.Config, k
 
 func (a *App) waitForDeferredFluxBootstrapOCI(ctx context.Context, cfg *config.Config, kubeconfigPath string) error {
 	env := a.kubectlEnv(kubeconfigPath)
-	if err := a.runCommand(ctx, env, nil, "kubectl", "wait", "--namespace", fluxNamespace, "--for=condition=Ready", "kustomization/"+fluxAppsKustomizationName, "--timeout=15m"); err != nil {
-		return err
-	}
-	for _, name := range []string{fluxIssuerKustomizationName, fluxClusterSecretsKustomizationName} {
-		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := a.probeCommand(waitCtx, env, nil, "kubectl", "wait", "--namespace", fluxNamespace, "--for=condition=Ready", "kustomization/"+name, "--timeout=5s")
-		cancel()
-		if err != nil {
-			a.logWarn("deferred Flux kustomization is not ready yet", "name", name)
+	for _, name := range []string{fluxIssuerKustomizationName, fluxClusterSecretsKustomizationName, fluxPublicEdgeKustomizationName, fluxAppsKustomizationName} {
+		if err := a.runCommand(ctx, env, nil, "kubectl", "wait", "--namespace", fluxNamespace, "--for=condition=Ready", "kustomization/"+name, "--timeout=15m"); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func (a *App) waitForPublicEdge(ctx context.Context, cfg *config.Config, kubeconfigPath string) error {
+	env := a.kubectlEnv(kubeconfigPath)
+	for _, args := range [][]string{
+		{"wait", "--namespace", publicEdgeNamespace, "--for=condition=Ready", "certificate/" + publicWildcardCertName, "--timeout=15m"},
+		{"wait", "--namespace", publicEdgeNamespace, "--for=condition=Accepted", "gateway/" + publicGatewayName, "--timeout=15m"},
+	} {
+		if err := a.runCommand(ctx, env, nil, "kubectl", args...); err != nil {
+			return err
+		}
+	}
+	lastError := ""
+	return waitFor(ctx, 5*time.Second, func(ctx context.Context) error {
+		err := a.probePublicEdge(ctx, cfg)
+		if err != nil && err.Error() != lastError {
+			a.logInfo("public edge not ready yet", "cluster", cfg.Cluster.Name, "error", err)
+			lastError = err.Error()
+		}
+		return err
+	})
+}
+
+func (a *App) publicEdgeStatus(ctx context.Context, cfg *config.Config, kubeconfigPath string) (bool, bool) {
+	env := a.kubectlEnv(kubeconfigPath)
+	check := func(args ...string) bool {
+		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		_, err := a.probeCommand(waitCtx, env, nil, "kubectl", args...)
+		return err == nil
+	}
+	certReady := check("wait", "--namespace", publicEdgeNamespace, "--for=condition=Ready", "certificate/"+publicWildcardCertName, "--timeout=5s")
+	gatewayAccepted := check("wait", "--namespace", publicEdgeNamespace, "--for=condition=Accepted", "gateway/"+publicGatewayName, "--timeout=5s")
+	if !certReady || !gatewayAccepted {
+		return false, certReady
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return a.probePublicEdge(probeCtx, cfg) == nil, certReady
+}
+
+func (a *App) probePublicEdge(ctx context.Context, cfg *config.Config) error {
+	hostname := publicEdgeProbeHostname(cfg)
+	if hostname == "" {
+		return fmt.Errorf("public edge hostname is missing")
+	}
+	publicIPs := publicNodeIPs(cfg)
+	if len(publicIPs) == 0 {
+		return fmt.Errorf("no public node IPs available for public edge probe")
+	}
+	for _, ip := range publicIPs {
+		if err := a.probePublicEdgeNode(ctx, hostname, ip); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *App) probePublicEdgeNode(ctx context.Context, hostname, ip string) error {
+	httpResp, err := publicEdgeHTTPClient(hostname, ip, 80, false).Do(mustNewHTTPRequest(ctx, http.MethodGet, "http://"+hostname+"/"))
+	if err != nil {
+		return fmt.Errorf("probe public edge HTTP on %s: %w", ip, err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode < 300 || httpResp.StatusCode > 399 {
+		return fmt.Errorf("probe public edge HTTP on %s: unexpected status %d", ip, httpResp.StatusCode)
+	}
+	location := strings.TrimSpace(httpResp.Header.Get("Location"))
+	if !strings.HasPrefix(location, "https://"+hostname) {
+		return fmt.Errorf("probe public edge HTTP on %s: unexpected redirect location %q", ip, location)
+	}
+
+	httpsResp, err := publicEdgeHTTPClient(hostname, ip, 443, true).Do(mustNewHTTPRequest(ctx, http.MethodGet, "https://"+hostname+"/"))
+	if err != nil {
+		return fmt.Errorf("probe public edge HTTPS on %s: %w", ip, err)
+	}
+	defer httpsResp.Body.Close()
+	if httpsResp.TLS == nil {
+		return fmt.Errorf("probe public edge HTTPS on %s: missing TLS state", ip)
+	}
+	if httpsResp.StatusCode >= 500 {
+		return fmt.Errorf("probe public edge HTTPS on %s: unexpected status %d", ip, httpsResp.StatusCode)
+	}
+	return nil
+}
+
+func publicEdgeProbeHostname(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	wildcard := strings.TrimSpace(cfg.AppWildcardHostname())
+	if strings.HasPrefix(wildcard, "*.") {
+		return "stardrive-probe." + strings.TrimPrefix(wildcard, "*.")
+	}
+	return ""
+}
+
+func publicEdgeHTTPClient(hostname, ip string, port int, useTLS bool) *http.Client {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return dialer.DialContext(ctx, network, net.JoinHostPort(strings.TrimSpace(ip), fmt.Sprintf("%d", port)))
+	}
+	if useTLS {
+		transport.TLSClientConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: strings.TrimSpace(hostname),
+		}
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func mustNewHTTPRequest(ctx context.Context, method, url string) *http.Request {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		panic(err)
+	}
+	return req
 }
 
 func (a *App) deleteFluxBootstrapResources(ctx context.Context, cfg *config.Config, kubeconfigPath string) error {
@@ -1019,7 +1260,25 @@ spec:
   interval: 5m0s
   prune: true
   wait: true
+  path: "./core/public-edge"
+  dependsOn:
+    - name: %s
+  sourceRef:
+    kind: OCIRepository
+    name: %s
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  interval: 5m0s
+  prune: true
+  wait: true
   path: "./apps"
+  dependsOn:
+    - name: %s
   sourceRef:
     kind: OCIRepository
     name: %s
@@ -1046,8 +1305,13 @@ spec:
 		fluxNamespace,
 		fluxKustomizationName,
 		fluxOCIRepositoryName,
+		fluxPublicEdgeKustomizationName,
+		fluxNamespace,
+		fluxIssuerKustomizationName,
+		fluxOCIRepositoryName,
 		fluxAppsKustomizationName,
 		fluxNamespace,
+		fluxPublicEdgeKustomizationName,
 		fluxOCIRepositoryName,
 	))
 }
@@ -1098,7 +1362,11 @@ func nodeDNSName(cfg *config.Config, node config.NodeConfig) string {
 	if strings.Contains(node.Name, ".") {
 		return node.Name
 	}
-	return node.Name + "." + cfg.DNS.Zone
+	baseDomain := strings.TrimSpace(cfg.AppBaseDomain())
+	if baseDomain == "" {
+		baseDomain = strings.TrimSpace(cfg.DNS.Zone)
+	}
+	return node.Name + "." + baseDomain
 }
 
 func deadlineOrNow(ctx context.Context) time.Time {

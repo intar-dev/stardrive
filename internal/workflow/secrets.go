@@ -27,13 +27,10 @@ const (
 	secretStorageBoxUsername  = "STORAGE_BOX_USERNAME"
 	secretStorageBoxPassword  = "STORAGE_BOX_PASSWORD"
 	secretStorageBoxSMBSource = "STORAGE_BOX_SMB_SOURCE"
-	secretStorageBoxWebDAVURL = "STORAGE_BOX_WEBDAV_URL"
 
 	secretHetznerNetworkID        = "HETZNER_NETWORK_ID"
 	secretHetznerPlacementGroupID = "HETZNER_PLACEMENT_GROUP_ID"
 	secretHetznerFirewallID       = "HETZNER_FIREWALL_ID"
-	secretHetznerLoadBalancerID   = "HETZNER_LOAD_BALANCER_ID"
-	secretHetznerLoadBalancerIPv4 = "HETZNER_LOAD_BALANCER_IPV4"
 	secretTalosBootImageID        = "TALOS_BOOT_IMAGE_ID"
 	secretTalosBootImageURL       = "TALOS_BOOT_IMAGE_URL"
 	secretTalosInstallerImage     = "TALOS_INSTALLER_IMAGE"
@@ -66,15 +63,12 @@ type storageBoxSecrets struct {
 	Username  string
 	Password  string
 	SMBSource string
-	WebDAVURL string
 }
 
 type runtimeSecrets struct {
 	NetworkID          int64
 	PlacementGroupID   int64
 	FirewallID         int64
-	LoadBalancerID     int64
-	LoadBalancerIPv4   string
 	BootImageID        int64
 	BootImageURL       string
 	InstallerImage     string
@@ -144,7 +138,6 @@ func (a *App) loadStorageBoxSecrets(ctx context.Context, cfg *config.Config) (st
 		Username:  values[secretStorageBoxUsername],
 		Password:  values[secretStorageBoxPassword],
 		SMBSource: values[secretStorageBoxSMBSource],
-		WebDAVURL: values[secretStorageBoxWebDAVURL],
 	}
 	if secrets.ID <= 0 || secrets.Username == "" || secrets.Password == "" || secrets.SMBSource == "" {
 		return storageBoxSecrets{}, fmt.Errorf("storage box secrets are missing from Infisical path %s", cfg.Secrets().ClusterBootstrap)
@@ -166,14 +159,11 @@ func (a *App) loadRuntimeSecrets(ctx context.Context, cfg *config.Config) (runti
 	networkID, _ := parseInt64(values[secretHetznerNetworkID])
 	placementGroupID, _ := parseInt64(values[secretHetznerPlacementGroupID])
 	firewallID, _ := parseInt64(values[secretHetznerFirewallID])
-	loadBalancerID, _ := parseInt64(values[secretHetznerLoadBalancerID])
 	bootImageID, _ := parseInt64(values[secretTalosBootImageID])
 	return runtimeSecrets{
 		NetworkID:          networkID,
 		PlacementGroupID:   placementGroupID,
 		FirewallID:         firewallID,
-		LoadBalancerID:     loadBalancerID,
-		LoadBalancerIPv4:   values[secretHetznerLoadBalancerIPv4],
 		BootImageID:        bootImageID,
 		BootImageURL:       values[secretTalosBootImageURL],
 		InstallerImage:     firstNonEmpty(values[secretTalosInstallerImage], values[secretTalosInstallerImageRef]),

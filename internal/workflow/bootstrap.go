@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/intar-dev/stardrive/internal/cloudflare"
 	"github.com/intar-dev/stardrive/internal/config"
 	"github.com/intar-dev/stardrive/internal/hetzner"
 	"github.com/intar-dev/stardrive/internal/infisical"
@@ -227,13 +226,10 @@ func (a *App) Bootstrap(ctx context.Context, req BootstrapRequest) error {
 		runtime.NetworkID = nextRuntime.NetworkID
 		runtime.PlacementGroupID = nextRuntime.PlacementGroupID
 		runtime.FirewallID = nextRuntime.FirewallID
-		runtime.LoadBalancerID = nextRuntime.LoadBalancerID
-		runtime.LoadBalancerIPv4 = nextRuntime.LoadBalancerIPv4
 		return map[string]any{
 			"networkId":        runtime.NetworkID,
 			"placementGroupId": runtime.PlacementGroupID,
 			"firewallId":       runtime.FirewallID,
-			"loadBalancerId":   runtime.LoadBalancerID,
 		}, nil
 	}); err != nil {
 		return err
@@ -259,20 +255,12 @@ func (a *App) Bootstrap(ctx context.Context, req BootstrapRequest) error {
 		if err := a.ensureClusterServers(ctx, cfg, hzClient, infClient, runtime, renderedConfigs); err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(infra.CloudflareToken) != "" && strings.TrimSpace(runtime.LoadBalancerIPv4) != "" {
-			cfClient := cloudflare.New(infra.CloudflareToken)
-			if err := cfClient.UpsertARecords(ctx, cfg.DNS.Zone, cfg.DNS.APIHostname, []string{runtime.LoadBalancerIPv4}, false); err != nil {
+		if strings.TrimSpace(infra.CloudflareToken) != "" {
+			if err := syncClusterDNS(ctx, cfg, infra.CloudflareToken); err != nil {
 				return nil, err
 			}
-			if cfg.DNS.ManageNodeRecords {
-				for _, node := range cfg.Nodes {
-					if strings.TrimSpace(node.PublicIPv4) == "" {
-						continue
-					}
-					if err := cfClient.UpsertARecords(ctx, cfg.DNS.Zone, nodeDNSName(cfg, node), []string{node.PublicIPv4}, false); err != nil {
-						return nil, err
-					}
-				}
+			if err := syncClusterReverseDNS(ctx, cfg, hzClient); err != nil {
+				return nil, err
 			}
 		}
 		if err := a.saveConfig(req.ConfigPath, cfg); err != nil {
@@ -300,7 +288,10 @@ func (a *App) Bootstrap(ctx context.Context, req BootstrapRequest) error {
 	}
 
 	if err := a.runPhase(op, "bootstrap-etcd", func() (any, error) {
-		first := firstControlPlaneIP(cfg)
+		first, err := a.firstReachableControlPlaneIP(ctx, cfg, accessSecrets.TalosconfigYAML)
+		if err != nil {
+			return nil, err
+		}
 		client, err := talos.NewClient(first, accessSecrets.TalosconfigYAML)
 		if err != nil {
 			return nil, err
@@ -315,7 +306,10 @@ func (a *App) Bootstrap(ctx context.Context, req BootstrapRequest) error {
 	}
 
 	if err := a.runPhase(op, "fetch-access", func() (any, error) {
-		first := firstControlPlaneIP(cfg)
+		first, err := a.firstReachableControlPlaneIP(ctx, cfg, accessSecrets.TalosconfigYAML)
+		if err != nil {
+			return nil, err
+		}
 		kubeconfig, err := a.fetchKubeconfig(ctx, first, accessSecrets.TalosconfigYAML)
 		if err != nil {
 			return nil, err
@@ -341,9 +335,6 @@ func (a *App) Bootstrap(ctx context.Context, req BootstrapRequest) error {
 		defer cleanup()
 		waitCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 		defer cancel()
-		if err := a.waitForLoadBalancerTargets(waitCtx, cfg, hzClient, runtime); err != nil {
-			return nil, err
-		}
 		if err := a.waitForKubernetesAPI(waitCtx, cfg, kubeconfigPath); err != nil {
 			return nil, err
 		}
@@ -426,6 +417,9 @@ func (a *App) Bootstrap(ctx context.Context, req BootstrapRequest) error {
 			return nil, err
 		}
 		if err := a.waitForKubernetesNodes(ctx, cfg, kubeconfigPath); err != nil {
+			return nil, err
+		}
+		if err := a.waitForPublicEdge(ctx, cfg, kubeconfigPath); err != nil {
 			return nil, err
 		}
 		return map[string]bool{"healthy": true}, nil
@@ -841,7 +835,6 @@ func (a *App) ensureStorageBox(ctx context.Context, cfg *config.Config, hzClient
 			Username:  box.Username,
 			Password:  existing.Password,
 			SMBSource: hzClient.StorageBoxSMBSource(box.Username),
-			WebDAVURL: fmt.Sprintf("https://%s.your-storagebox.de", box.Username),
 		}
 		if err := hzClient.UpdateStorageBoxAccessSettings(ctx, secrets.ID, true); err != nil {
 			return storageBoxSecrets{}, err
@@ -854,7 +847,6 @@ func (a *App) ensureStorageBox(ctx context.Context, cfg *config.Config, hzClient
 			secretStorageBoxUsername:  secrets.Username,
 			secretStorageBoxPassword:  secrets.Password,
 			secretStorageBoxSMBSource: secrets.SMBSource,
-			secretStorageBoxWebDAVURL: secrets.WebDAVURL,
 		}); err != nil {
 			return storageBoxSecrets{}, err
 		}
@@ -879,7 +871,6 @@ func (a *App) ensureStorageBox(ctx context.Context, cfg *config.Config, hzClient
 		Username:  ready.Username,
 		Password:  password,
 		SMBSource: hzClient.StorageBoxSMBSource(ready.Username),
-		WebDAVURL: fmt.Sprintf("https://%s.your-storagebox.de", ready.Username),
 	}
 	if err := hzClient.UpdateStorageBoxAccessSettings(ctx, secrets.ID, true); err != nil {
 		return storageBoxSecrets{}, err
@@ -892,7 +883,6 @@ func (a *App) ensureStorageBox(ctx context.Context, cfg *config.Config, hzClient
 		secretStorageBoxUsername:  secrets.Username,
 		secretStorageBoxPassword:  secrets.Password,
 		secretStorageBoxSMBSource: secrets.SMBSource,
-		secretStorageBoxWebDAVURL: secrets.WebDAVURL,
 	}); err != nil {
 		return storageBoxSecrets{}, err
 	}

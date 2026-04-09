@@ -29,8 +29,6 @@ type DestroyRequest struct {
 	Force      bool
 }
 
-type ServerListRequest struct{}
-
 type GitOpsPublishRequest struct {
 	ConfigPath string
 }

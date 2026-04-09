@@ -23,6 +23,7 @@ import (
 	"github.com/intar-dev/stardrive/internal/config"
 	"github.com/intar-dev/stardrive/internal/fs"
 	"github.com/intar-dev/stardrive/internal/operation"
+	"github.com/intar-dev/stardrive/internal/talos"
 	"gopkg.in/yaml.v3"
 )
 
@@ -32,8 +33,10 @@ const (
 	fluxKustomizationName               = "stardrive"
 	fluxCertManagerKustomizationName    = "stardrive-cert-manager"
 	fluxIssuerKustomizationName         = "stardrive-cert-manager-issuer"
+	fluxPublicEdgeKustomizationName     = "stardrive-public-edge"
 	fluxClusterSecretsKustomizationName = "stardrive-cluster-secrets"
 	fluxAppsKustomizationName           = "stardrive-apps"
+	defaultCiliumCLIVersion             = "v0.19.2"
 	defaultORASCLIVersion               = "v1.3.0"
 )
 
@@ -423,29 +426,58 @@ func firstControlPlaneIP(cfg *config.Config) string {
 	return ips[0]
 }
 
+func (a *App) firstReachableControlPlaneIP(ctx context.Context, cfg *config.Config, talosconfig []byte) (string, error) {
+	endpoints := controlPlaneIPs(cfg)
+	if len(endpoints) == 0 {
+		return "", fmt.Errorf("no control-plane public IPv4 addresses are available")
+	}
+	if len(bytes.TrimSpace(talosconfig)) == 0 {
+		return "", fmt.Errorf("talosconfig is missing")
+	}
+	failures := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		client, err := talos.NewClient(endpoint, talosconfig)
+		if err != nil {
+			cancel()
+			failures = append(failures, fmt.Sprintf("%s: %v", endpoint, err))
+			continue
+		}
+		_, err = client.Version(probeCtx)
+		_ = client.Close()
+		cancel()
+		if err == nil {
+			return endpoint, nil
+		}
+		failures = append(failures, fmt.Sprintf("%s: %v", endpoint, err))
+	}
+	return "", fmt.Errorf("no reachable control-plane Talos endpoint found: %s", strings.Join(failures, "; "))
+}
+
+func publicNodeIPs(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	ips := make([]string, 0, len(cfg.Nodes))
+	for _, node := range cfg.Nodes {
+		if ip := strings.TrimSpace(node.PublicIPv4); ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+	return uniqueNonEmpty(ips)
+}
+
 func trimVersionPrefix(version string) string {
 	return strings.TrimPrefix(strings.TrimSpace(version), "v")
 }
 
 func (a *App) ensureCiliumCLI(ctx context.Context) (string, error) {
-	if path, err := exec.LookPath("cilium"); err == nil {
-		return path, nil
-	}
-
 	targetDir := filepath.Join(a.opts.Paths.StateDir, "bin")
 	if err := fs.EnsureDir(targetDir, 0o755); err != nil {
 		return "", err
 	}
 
-	version, err := fetchText(ctx, "https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt")
-	if err != nil {
-		return "", fmt.Errorf("resolve cilium CLI stable version: %w", err)
-	}
-	version = strings.TrimSpace(version)
-	if version == "" {
-		return "", fmt.Errorf("cilium CLI stable version is empty")
-	}
-
+	version := defaultCiliumCLIVersion
 	binaryPath := filepath.Join(targetDir, "cilium-"+version)
 	if info, err := os.Stat(binaryPath); err == nil && !info.IsDir() {
 		return binaryPath, nil

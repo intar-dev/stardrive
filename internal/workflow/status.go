@@ -10,11 +10,14 @@ import (
 )
 
 type StatusResult struct {
-	Config        *config.Config
-	Runtime       runtimeSecrets
-	Storage       storageBoxSecrets
-	TalosHealthy  bool
-	KubernetesOut string
+	Config            *config.Config
+	Runtime           runtimeSecrets
+	Storage           storageBoxSecrets
+	TalosHealthy      bool
+	KubernetesOut     string
+	PublicEdgeChecked bool
+	GatewayReady      bool
+	WildcardCertReady bool
 }
 
 func (r *StatusResult) String() string {
@@ -29,7 +32,7 @@ func (r *StatusResult) String() string {
 	}
 
 	base := fmt.Sprintf(
-		"Cluster:  %s\nTalos:    %s (%s)\nK8s:      %s\nCilium:   %s\nFlux:     %s\nNodes:    %d\nServer:   %s @ %s\nStorage:  %s @ %s\nRegistry: %s\n",
+		"Cluster:  %s\nTalos:    %s (%s)\nK8s:      %s\nCilium:   %s\nFlux:     %s\nNodes:    %d\nServer:   %s @ %s\nStorage:  %s @ %s\nRegistry: %s\nAPI:      %s -> %s\nApps:     %s -> %s\n",
 		cfg.Cluster.Name,
 		cfg.Cluster.TalosVersion,
 		talosStatus,
@@ -42,9 +45,23 @@ func (r *StatusResult) String() string {
 		cfg.Storage.StorageBoxPlan,
 		cfg.Storage.StorageBoxLocation,
 		cfg.EffectiveRegistryAddress(),
+		cfg.DNS.APIHostname,
+		joinCSV(publicNodeIPs(cfg)),
+		cfg.AppWildcardHostname(),
+		joinCSV(publicNodeIPs(cfg)),
 	)
-	if strings.TrimSpace(r.Runtime.LoadBalancerIPv4) != "" {
-		base += fmt.Sprintf("API LB:   %s -> %s\n", cfg.DNS.APIHostname, r.Runtime.LoadBalancerIPv4)
+	if r.PublicEdgeChecked {
+		gatewayStatus := "pending"
+		if r.GatewayReady {
+			gatewayStatus = "ready"
+		}
+		tlsStatus := "pending"
+		if r.WildcardCertReady {
+			tlsStatus = "ready"
+		}
+		base += fmt.Sprintf("Gateway:  %s\nTLS:      %s\n", gatewayStatus, tlsStatus)
+	} else {
+		base += "Gateway:  unknown\nTLS:      unknown\n"
 	}
 	if strings.TrimSpace(r.KubernetesOut) != "" {
 		base += "\nKubernetes Nodes:\n" + strings.TrimSpace(r.KubernetesOut) + "\n"
@@ -76,6 +93,8 @@ func (a *App) Status(ctx context.Context, req StatusRequest) (*StatusResult, err
 				if cmdErr == nil {
 					result.KubernetesOut = string(out)
 				}
+				result.GatewayReady, result.WildcardCertReady = a.publicEdgeStatus(ctx, cfg, kubeconfigPath)
+				result.PublicEdgeChecked = true
 			}
 		}
 	}

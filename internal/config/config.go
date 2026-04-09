@@ -20,7 +20,6 @@ const (
 	DefaultFluxVersion        = "v2.7.3"
 	DefaultHetznerCCMVersion  = "v1.26.0"
 	DefaultSMBDriverVersion   = "v1.20.1"
-	DefaultHetznerLBType      = "lb11"
 	DefaultPrivateNetworkCIDR = "10.42.0.0/24"
 	DefaultStorageClassName   = "storagebox-rwx"
 	DefaultStorageShareName   = "stardrive"
@@ -47,6 +46,11 @@ const (
 	EnvCloudflareAPIHostname = "CLOUDFLARE_API_HOSTNAME"
 	EnvCloudflareNodeRecords = "CLOUDFLARE_MANAGE_NODE_RECORDS"
 	EnvACMEEmail             = "ACME_EMAIL"
+	EnvHCloudServerType      = "HCLOUD_SERVER_TYPE"
+	EnvHCloudLocation        = "HCLOUD_LOCATION"
+	EnvHCloudPrivateNetCIDR  = "HCLOUD_PRIVATE_NETWORK_CIDR"
+	EnvStorageBoxPlan        = "STORAGE_BOX_PLAN"
+	EnvStorageBoxLocation    = "STORAGE_BOX_LOCATION"
 )
 
 func (p Paths) WithDefaults() Paths {
@@ -113,7 +117,6 @@ type HetznerConfig struct {
 	Location           string `yaml:"location"`
 	NetworkZone        string `yaml:"networkZone,omitempty"`
 	PrivateNetworkCIDR string `yaml:"privateNetworkCIDR"`
-	LoadBalancerType   string `yaml:"loadBalancerType"`
 	PublicIPv6         bool   `yaml:"publicIPv6,omitempty"`
 }
 
@@ -239,14 +242,16 @@ func (c *Config) ApplyDefaults() {
 		}
 	}
 
-	c.Hetzner.ServerType = strings.TrimSpace(c.Hetzner.ServerType)
-	c.Hetzner.Location = strings.TrimSpace(c.Hetzner.Location)
+	c.Hetzner.ServerType = defaultString(strings.TrimSpace(c.Hetzner.ServerType), os.Getenv(EnvHCloudServerType))
+	c.Hetzner.Location = defaultString(strings.TrimSpace(c.Hetzner.Location), os.Getenv(EnvHCloudLocation))
 	c.Hetzner.NetworkZone = strings.TrimSpace(c.Hetzner.NetworkZone)
-	c.Hetzner.PrivateNetworkCIDR = defaultString(c.Hetzner.PrivateNetworkCIDR, DefaultPrivateNetworkCIDR)
-	c.Hetzner.LoadBalancerType = defaultString(c.Hetzner.LoadBalancerType, DefaultHetznerLBType)
+	c.Hetzner.PrivateNetworkCIDR = defaultString(
+		defaultString(strings.TrimSpace(c.Hetzner.PrivateNetworkCIDR), os.Getenv(EnvHCloudPrivateNetCIDR)),
+		DefaultPrivateNetworkCIDR,
+	)
 
-	c.Storage.StorageBoxPlan = strings.TrimSpace(c.Storage.StorageBoxPlan)
-	c.Storage.StorageBoxLocation = strings.TrimSpace(c.Storage.StorageBoxLocation)
+	c.Storage.StorageBoxPlan = defaultString(strings.TrimSpace(c.Storage.StorageBoxPlan), os.Getenv(EnvStorageBoxPlan))
+	c.Storage.StorageBoxLocation = defaultString(strings.TrimSpace(c.Storage.StorageBoxLocation), os.Getenv(EnvStorageBoxLocation))
 	c.Storage.StorageClassName = defaultString(c.Storage.StorageClassName, DefaultStorageClassName)
 	c.Storage.ShareName = defaultString(c.Storage.ShareName, DefaultStorageShareName)
 	c.Storage.BootstrapPVCSize = defaultString(c.Storage.BootstrapPVCSize, "100Gi")
@@ -314,8 +319,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("hetzner.location is required")
 	case c.Hetzner.PrivateNetworkCIDR == "":
 		return fmt.Errorf("hetzner.privateNetworkCIDR is required")
-	case c.Hetzner.LoadBalancerType == "":
-		return fmt.Errorf("hetzner.loadBalancerType is required")
 	case c.Storage.StorageBoxPlan == "":
 		return fmt.Errorf("storage.storageBoxPlan is required")
 	case c.Storage.StorageBoxLocation == "":
@@ -440,6 +443,31 @@ func (c *Config) RegistryNamespace() string {
 	return namespace
 }
 
+func (c *Config) AppBaseDomain() string {
+	if c == nil {
+		return ""
+	}
+
+	zone := strings.TrimSpace(c.DNS.Zone)
+	if zone != "" && !looksLikeCloudflareZoneID(zone) {
+		return strings.TrimPrefix(zone, "*.")
+	}
+
+	apiHostname := strings.TrimSpace(c.DNS.APIHostname)
+	if parts := strings.SplitN(apiHostname, ".", 2); len(parts) == 2 {
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
+}
+
+func (c *Config) AppWildcardHostname() string {
+	base := strings.TrimSpace(c.AppBaseDomain())
+	if base == "" {
+		return ""
+	}
+	return "*." + base
+}
+
 func (c *Config) Secrets() SecretPaths {
 	root := normalizeSecretPath(c.Infisical.PathRoot)
 	cluster := names.Slugify(c.Cluster.Name)
@@ -507,6 +535,22 @@ func lookupEnvBool(key string) (bool, bool) {
 		return false, false
 	}
 	return parsed, true
+}
+
+func looksLikeCloudflareZoneID(value string) bool {
+	if len(strings.TrimSpace(value)) != 32 {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (n NodeConfig) ProviderID() int64 {

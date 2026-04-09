@@ -3,7 +3,9 @@ package hetzner
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -180,56 +182,96 @@ func TestUpdateStorageBoxAccessSettingsUsesExpectedEndpoint(t *testing.T) {
 	}
 }
 
-func TestBuildLabelSelectorUsesHetznerSafeKeys(t *testing.T) {
-	selector := buildLabelSelector(map[string]string{
-		"stardrive.dev-managed-by": "stardrive",
-		"stardrive.dev-cluster":    "intar",
-		"stardrive.dev-image-id":   "abc123",
-	})
-	if strings.Contains(selector, "/") {
-		t.Fatalf("label selector should not contain slash-delimited keys: %s", selector)
+func TestEnsureFirewallOpensPublicEdgePorts(t *testing.T) {
+	rules := firewallRules(nil)
+	ports := map[string]struct{}{}
+	for _, rule := range rules {
+		if rule.Port != nil {
+			ports[*rule.Port] = struct{}{}
+		}
 	}
-	if !strings.Contains(selector, "stardrive.dev-managed-by=stardrive") {
-		t.Fatalf("missing managed-by selector: %s", selector)
-	}
-	if !strings.Contains(selector, "stardrive.dev-cluster=intar") {
-		t.Fatalf("missing cluster selector: %s", selector)
-	}
-	if !strings.Contains(selector, "stardrive.dev-image-id=abc123") {
-		t.Fatalf("missing image-id selector: %s", selector)
+	for _, port := range []string{"50000", "6443", "80", "443"} {
+		if _, ok := ports[port]; !ok {
+			t.Fatalf("expected firewall rules to expose port %s, got %#v", port, ports)
+		}
 	}
 }
 
-func TestEvaluateLoadBalancerTargetsRequiresAttachmentAndHealthyStatus(t *testing.T) {
-	ready, summary := evaluateLoadBalancerTargets([]hcloud.LoadBalancerTarget{
-		{
-			Server: &hcloud.LoadBalancerTargetServer{
-				Server: &hcloud.Server{ID: 101},
-			},
-			HealthStatus: []hcloud.LoadBalancerTargetHealthStatus{
-				{ListenPort: 6443, Status: hcloud.LoadBalancerTargetHealthStatusStatusHealthy},
-			},
-		},
-		{
-			Server: &hcloud.LoadBalancerTargetServer{
-				Server: &hcloud.Server{ID: 202},
-			},
-			HealthStatus: []hcloud.LoadBalancerTargetHealthStatus{
-				{ListenPort: 6443, Status: hcloud.LoadBalancerTargetHealthStatusStatusUnknown},
-			},
-		},
-	}, []int64{101, 202, 303}, 6443)
+func TestFirewallRulesEqualIgnoresOrderingButDetectsDrift(t *testing.T) {
+	rules := firewallRules([]string{"203.0.113.0/24"})
+	reordered := append([]hcloud.FirewallRule(nil), rules...)
+	slices.Reverse(reordered)
 
-	if ready {
-		t.Fatal("expected targets to be not ready")
+	if !firewallRulesEqual(rules, reordered) {
+		t.Fatalf("expected firewall rules to compare equal after reordering")
 	}
-	if !strings.Contains(summary, "101:healthy") {
-		t.Fatalf("expected healthy target in summary, got %q", summary)
+
+	drifted := append([]hcloud.FirewallRule(nil), rules...)
+	port := "8443"
+	drifted[0].Port = &port
+	if firewallRulesEqual(rules, drifted) {
+		t.Fatalf("expected firewall rules with drifted port to compare unequal")
 	}
-	if !strings.Contains(summary, "202:unknown") {
-		t.Fatalf("expected unknown target in summary, got %q", summary)
+}
+
+func TestFromHCloudServerCapturesReconciliationMetadata(t *testing.T) {
+	server := &hcloud.Server{
+		ID:     42,
+		Name:   "control-plane-01",
+		Status: hcloud.ServerStatusRunning,
+		ServerType: &hcloud.ServerType{
+			Name: "cpx21",
+		},
+		Location: &hcloud.Location{
+			Name: "fsn1",
+		},
+		Image: &hcloud.Image{
+			ID: 77,
+		},
+		PlacementGroup: &hcloud.PlacementGroup{
+			ID: 9,
+		},
+		PublicNet: hcloud.ServerPublicNet{
+			IPv4: hcloud.ServerPublicNetIPv4{
+				IP: net.ParseIP("49.13.142.173"),
+			},
+			Firewalls: []*hcloud.ServerFirewallStatus{
+				{Firewall: hcloud.Firewall{ID: 5}},
+				{Firewall: hcloud.Firewall{ID: 6}},
+			},
+		},
+		PrivateNet: []hcloud.ServerPrivateNet{
+			{
+				Network: &hcloud.Network{ID: 11},
+				IP:      net.ParseIP("10.42.0.10"),
+			},
+			{
+				Network: &hcloud.Network{ID: 12},
+				IP:      net.ParseIP("10.42.0.11"),
+			},
+		},
 	}
-	if !strings.Contains(summary, "303:missing") {
-		t.Fatalf("expected missing target in summary, got %q", summary)
+
+	converted := fromHCloudServer(server)
+	if converted == nil {
+		t.Fatal("expected converted server")
+	}
+	if converted.ImageID != 77 {
+		t.Fatalf("expected image ID 77, got %d", converted.ImageID)
+	}
+	if converted.PlacementGroupID != 9 {
+		t.Fatalf("expected placement group ID 9, got %d", converted.PlacementGroupID)
+	}
+	if converted.PublicIPv4 != "49.13.142.173" {
+		t.Fatalf("expected public IPv4 to be captured, got %q", converted.PublicIPv4)
+	}
+	if converted.PrivateIPv4 != "10.42.0.10" {
+		t.Fatalf("expected first private IPv4 to be captured, got %q", converted.PrivateIPv4)
+	}
+	if !slices.Equal(converted.NetworkIDs, []int64{11, 12}) {
+		t.Fatalf("expected network IDs [11 12], got %v", converted.NetworkIDs)
+	}
+	if !slices.Equal(converted.FirewallIDs, []int64{5, 6}) {
+		t.Fatalf("expected firewall IDs [5 6], got %v", converted.FirewallIDs)
 	}
 }

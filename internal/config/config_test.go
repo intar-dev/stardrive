@@ -51,7 +51,6 @@ func TestValidateRequiresOddHetznerControlPlanes(t *testing.T) {
 			ServerType:         "cax11",
 			Location:           "fsn1",
 			PrivateNetworkCIDR: DefaultPrivateNetworkCIDR,
-			LoadBalancerType:   DefaultHetznerLBType,
 		},
 		Storage: StorageConfig{
 			StorageBoxPlan:     "BX11",
@@ -88,6 +87,11 @@ func TestApplyDefaultsReadsEnv(t *testing.T) {
 	t.Setenv(EnvCloudflareAPIHostname, "api.example.com")
 	t.Setenv(EnvCloudflareNodeRecords, "true")
 	t.Setenv(EnvACMEEmail, "platform@example.com")
+	t.Setenv(EnvHCloudServerType, "cpx21")
+	t.Setenv(EnvHCloudLocation, "fsn1")
+	t.Setenv(EnvHCloudPrivateNetCIDR, "10.99.0.0/24")
+	t.Setenv(EnvStorageBoxPlan, "BX11")
+	t.Setenv(EnvStorageBoxLocation, "nbg1")
 
 	cfg := &Config{}
 	cfg.ApplyDefaults()
@@ -128,8 +132,20 @@ func TestApplyDefaultsReadsEnv(t *testing.T) {
 	if !cfg.DNS.ManageNodeRecordsSet {
 		t.Fatalf("expected ManageNodeRecordsSet to be true")
 	}
-	if cfg.Hetzner.PrivateNetworkCIDR != DefaultPrivateNetworkCIDR {
+	if cfg.Hetzner.ServerType != "cpx21" {
+		t.Fatalf("unexpected Hetzner server type: %q", cfg.Hetzner.ServerType)
+	}
+	if cfg.Hetzner.Location != "fsn1" {
+		t.Fatalf("unexpected Hetzner location: %q", cfg.Hetzner.Location)
+	}
+	if cfg.Hetzner.PrivateNetworkCIDR != "10.99.0.0/24" {
 		t.Fatalf("unexpected default network CIDR: %q", cfg.Hetzner.PrivateNetworkCIDR)
+	}
+	if cfg.Storage.StorageBoxPlan != "BX11" {
+		t.Fatalf("unexpected storage box plan: %q", cfg.Storage.StorageBoxPlan)
+	}
+	if cfg.Storage.StorageBoxLocation != "nbg1" {
+		t.Fatalf("unexpected storage box location: %q", cfg.Storage.StorageBoxLocation)
 	}
 	if cfg.Storage.StorageClassName != DefaultStorageClassName {
 		t.Fatalf("unexpected default storage class: %q", cfg.Storage.StorageClassName)
@@ -168,7 +184,6 @@ hetzner:
   serverType: cax11
   location: fsn1
   privateNetworkCIDR: 10.42.0.0/24
-  loadBalancerType: lb11
 storage:
   storageBoxPlan: BX11
   storageBoxLocation: fsn1
@@ -226,6 +241,32 @@ infisical:
 
 	if _, err := Load(path); err == nil {
 		t.Fatalf("expected Load to fail for incomplete bootstrap draft")
+	}
+}
+
+func TestAppWildcardHostnameUsesZoneName(t *testing.T) {
+	cfg := &Config{
+		DNS: DNSConfig{
+			Zone:        "intar.app",
+			APIHostname: "api.intar.app",
+		},
+	}
+
+	if got := cfg.AppWildcardHostname(); got != "*.intar.app" {
+		t.Fatalf("unexpected wildcard hostname: %q", got)
+	}
+}
+
+func TestAppWildcardHostnameFallsBackToAPIHostnameWhenZoneIsID(t *testing.T) {
+	cfg := &Config{
+		DNS: DNSConfig{
+			Zone:        "cd5aa63e949cca2558dc73daa657759e",
+			APIHostname: "api.intar.app",
+		},
+	}
+
+	if got := cfg.AppWildcardHostname(); got != "*.intar.app" {
+		t.Fatalf("unexpected wildcard hostname: %q", got)
 	}
 }
 

@@ -2,6 +2,14 @@ package workflow
 
 import "testing"
 
+func TestCiliumCLIVersionIsPinned(t *testing.T) {
+	t.Parallel()
+
+	if defaultCiliumCLIVersion != "v0.19.2" {
+		t.Fatalf("expected pinned Cilium CLI version v0.19.2, got %q", defaultCiliumCLIVersion)
+	}
+}
+
 func TestEnsureClusterAccessSecretsSkipsReloadWhenExistingSecretsSatisfyRequirement(t *testing.T) {
 	t.Parallel()
 

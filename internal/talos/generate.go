@@ -128,6 +128,10 @@ func GenerateConfig(ctx context.Context, params GenConfigParams) (*GenConfigResu
 	if err != nil {
 		return nil, fmt.Errorf("encode control-plane config: %w", err)
 	}
+	controlPlane, err = disableKubeProxy(controlPlane)
+	if err != nil {
+		return nil, fmt.Errorf("disable kube-proxy in control-plane config: %w", err)
+	}
 
 	workerConfig, err := input.Config(machine.TypeWorker)
 	if err != nil {
@@ -136,6 +140,10 @@ func GenerateConfig(ctx context.Context, params GenConfigParams) (*GenConfigResu
 	worker, err := workerConfig.Bytes()
 	if err != nil {
 		return nil, fmt.Errorf("encode worker config: %w", err)
+	}
+	worker, err = disableKubeProxy(worker)
+	if err != nil {
+		return nil, fmt.Errorf("disable kube-proxy in worker config: %w", err)
 	}
 
 	clientConfig, err := input.Talosconfig()
@@ -152,6 +160,41 @@ func GenerateConfig(ctx context.Context, params GenConfigParams) (*GenConfigResu
 		Worker:       worker,
 		Talosconfig:  talosconfigBytes,
 	}, nil
+}
+
+func disableKubeProxy(configYAML []byte) ([]byte, error) {
+	var document map[string]any
+	if err := yaml.Unmarshal(configYAML, &document); err != nil {
+		return nil, fmt.Errorf("decode generated config: %w", err)
+	}
+
+	clusterMap := nestedStringMap(document, "cluster")
+	clusterMap["proxy"] = map[string]any{
+		"disabled": true,
+	}
+
+	data, err := yaml.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("encode generated config: %w", err)
+	}
+
+	return data, nil
+}
+
+func nestedStringMap(parent map[string]any, key string) map[string]any {
+	if parent == nil {
+		parent = map[string]any{}
+	}
+	if value, ok := parent[key]; ok {
+		if existing, ok := value.(map[string]any); ok {
+			return existing
+		}
+	}
+
+	child := map[string]any{}
+	parent[key] = child
+
+	return child
 }
 
 func buildInstallerImage(talosVersion, talosSchematic string) string {

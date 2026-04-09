@@ -5,3 +5,4 @@ resources:
   - cert-manager
   - cert-manager-issuer
   - cluster-secrets
+  - public-edge

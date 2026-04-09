@@ -207,7 +207,6 @@ func workflowTestConfig(count int) *config.Config {
 			Location:           "fsn1",
 			NetworkZone:        "eu-central",
 			PrivateNetworkCIDR: config.DefaultPrivateNetworkCIDR,
-			LoadBalancerType:   config.DefaultHetznerLBType,
 		},
 		Storage: config.StorageConfig{
 			StorageBoxPlan:     "BX11",

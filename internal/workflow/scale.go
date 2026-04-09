@@ -124,7 +124,7 @@ func (a *App) Scale(ctx context.Context, req ScaleRequest) error {
 					return nil, err
 				}
 			}
-			if runtime.NetworkID == 0 || runtime.LoadBalancerID == 0 {
+			if runtime.NetworkID == 0 {
 				nextRuntime, err := a.ensureHetznerNetworking(ctx, targetCfg, hzClient, infClient)
 				if err != nil {
 					return nil, err
@@ -214,18 +214,6 @@ func (a *App) Scale(ctx context.Context, req ScaleRequest) error {
 			}
 		}
 
-		if runtime.LoadBalancerID > 0 {
-			serverIDs := make([]int64, 0, len(targetCfg.Nodes))
-			for _, node := range targetCfg.Nodes {
-				if node.ProviderID() > 0 {
-					serverIDs = append(serverIDs, node.ProviderID())
-				}
-			}
-			if err := hzClient.SyncLoadBalancerTargetsByID(ctx, runtime.LoadBalancerID, serverIDs); err != nil {
-				return nil, err
-			}
-		}
-
 		cfg = targetCfg
 		return map[string]any{
 			"count":   len(cfg.Nodes),
@@ -237,24 +225,24 @@ func (a *App) Scale(ctx context.Context, req ScaleRequest) error {
 	}
 
 	if err := a.runPhase(op, "update-dns", func() (any, error) {
-		if strings.TrimSpace(infra.CloudflareToken) == "" || !cfg.DNS.ManageNodeRecords {
-			return map[string]string{"skipped": "node DNS management disabled"}, nil
+		if strings.TrimSpace(infra.CloudflareToken) == "" {
+			return map[string]string{"skipped": "cloudflare token missing"}, nil
 		}
-		cfClient := cloudflare.New(infra.CloudflareToken)
-		for _, node := range removedNodes {
-			if err := cfClient.DeleteARecords(ctx, cfg.DNS.Zone, nodeDNSName(cfg, node)); err != nil {
-				return nil, err
+		if cfg.DNS.ManageNodeRecords {
+			cfClient := cloudflare.New(infra.CloudflareToken)
+			for _, node := range removedNodes {
+				if err := cfClient.DeleteARecords(ctx, cfg.DNS.Zone, nodeDNSName(cfg, node)); err != nil {
+					return nil, err
+				}
 			}
 		}
-		for _, node := range cfg.Nodes {
-			if strings.TrimSpace(node.PublicIPv4) == "" {
-				continue
-			}
-			if err := cfClient.UpsertARecords(ctx, cfg.DNS.Zone, nodeDNSName(cfg, node), []string{node.PublicIPv4}, false); err != nil {
-				return nil, err
-			}
+		if err := syncClusterDNS(ctx, cfg, infra.CloudflareToken); err != nil {
+			return nil, err
 		}
-		return map[string]any{"updated": len(cfg.Nodes), "removed": len(removedNodes)}, nil
+		if err := syncClusterReverseDNS(ctx, cfg, hzClient); err != nil {
+			return nil, err
+		}
+		return map[string]any{"updated": len(cfg.Nodes), "removed": len(removedNodes), "publicRecords": len(desiredPublicDNSRecords(cfg))}, nil
 	}); err != nil {
 		return err
 	}
@@ -283,6 +271,9 @@ func (a *App) Scale(ctx context.Context, req ScaleRequest) error {
 			if err := a.waitForKubernetesNodes(ctx, cfg, kubeconfigPath); err != nil {
 				return nil, err
 			}
+			if err := a.waitForPublicEdge(ctx, cfg, kubeconfigPath); err != nil {
+				return nil, err
+			}
 		}
 		return map[string]bool{"healthy": true}, nil
 	}); err != nil {
@@ -305,12 +296,6 @@ func mergeRuntimeSecrets(dst *runtimeSecrets, src runtimeSecrets) {
 	}
 	if src.FirewallID > 0 {
 		dst.FirewallID = src.FirewallID
-	}
-	if src.LoadBalancerID > 0 {
-		dst.LoadBalancerID = src.LoadBalancerID
-	}
-	if strings.TrimSpace(src.LoadBalancerIPv4) != "" {
-		dst.LoadBalancerIPv4 = src.LoadBalancerIPv4
 	}
 	if src.BootImageID > 0 {
 		dst.BootImageID = src.BootImageID

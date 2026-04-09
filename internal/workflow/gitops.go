@@ -188,7 +188,10 @@ func archiveDirectoryAsTarGz(root, outputPath string) error {
 }
 
 type gitOpsTemplateData struct {
-	ACMEEmail string
+	ACMEEmail         string
+	APIHostname       string
+	AppBaseDomain     string
+	AppWildcardDomain string
 }
 
 func renderGitOpsSource(sourceRoot string, cfg *config.Config) (string, func(), error) {
@@ -205,7 +208,12 @@ func renderGitOpsSource(sourceRoot string, cfg *config.Config) (string, func(), 
 		return "", nil, fmt.Errorf("create rendered gitops dir: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(renderedRoot) }
-	data := gitOpsTemplateData{ACMEEmail: cfg.Cluster.ACMEEmail}
+	data := gitOpsTemplateData{
+		ACMEEmail:         cfg.Cluster.ACMEEmail,
+		APIHostname:       cfg.DNS.APIHostname,
+		AppBaseDomain:     cfg.AppBaseDomain(),
+		AppWildcardDomain: cfg.AppWildcardHostname(),
+	}
 
 	if err := filepath.Walk(sourceRoot, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {

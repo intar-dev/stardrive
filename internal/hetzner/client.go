@@ -57,15 +57,19 @@ type Location struct {
 }
 
 type Server struct {
-	ID          int64
-	Name        string
-	Status      string
-	ServerType  string
-	Location    string
-	PublicIPv4  string
-	PublicIPv6  string
-	PrivateIPv4 string
-	Labels      map[string]string
+	ID               int64
+	Name             string
+	Status           string
+	ServerType       string
+	Location         string
+	PublicIPv4       string
+	PublicIPv6       string
+	PrivateIPv4      string
+	ImageID          int64
+	PlacementGroupID int64
+	NetworkIDs       []int64
+	FirewallIDs      []int64
+	Labels           map[string]string
 }
 
 type Network struct {
@@ -82,17 +86,6 @@ type PlacementGroup struct {
 type Firewall struct {
 	ID   int64
 	Name string
-}
-
-type LoadBalancer struct {
-	ID         int64
-	Name       string
-	PublicIPv4 string
-}
-
-type LoadBalancerTargetHealth struct {
-	ServerID int64
-	Status   string
 }
 
 type Image struct {
@@ -339,42 +332,31 @@ func (c *Client) EnsurePlacementGroup(ctx context.Context, name string) (*hcloud
 }
 
 func (c *Client) EnsureFirewall(ctx context.Context, name string, sshCIDRs []string) (*hcloud.Firewall, error) {
+	rules := firewallRules(sshCIDRs)
 	firewall, _, err := c.cloud.Firewall.GetByName(ctx, strings.TrimSpace(name))
 	if err != nil {
 		return nil, fmt.Errorf("lookup firewall %s: %w", name, err)
 	}
 	if firewall != nil {
-		return firewall, nil
-	}
-
-	talosPort := "50000"
-	apiPort := "6443"
-	rules := []hcloud.FirewallRule{
-		{
-			Direction: hcloud.FirewallRuleDirectionIn,
-			Protocol:  hcloud.FirewallRuleProtocolTCP,
-			Port:      &talosPort,
-			SourceIPs: []net.IPNet{mustIPNet("0.0.0.0/0")},
-		},
-		{
-			Direction: hcloud.FirewallRuleDirectionIn,
-			Protocol:  hcloud.FirewallRuleProtocolTCP,
-			Port:      &apiPort,
-			SourceIPs: []net.IPNet{mustIPNet("0.0.0.0/0")},
-		},
-	}
-	if len(sshCIDRs) > 0 {
-		sshPort := "22"
-		sourceIPs := make([]net.IPNet, 0, len(sshCIDRs))
-		for _, cidr := range sshCIDRs {
-			sourceIPs = append(sourceIPs, mustIPNet(cidr))
+		if !firewallRulesEqual(firewall.Rules, rules) {
+			actions, _, err := c.cloud.Firewall.SetRules(ctx, firewall, hcloud.FirewallSetRulesOpts{Rules: rules})
+			if err != nil {
+				return nil, fmt.Errorf("reconcile firewall %s rules: %w", name, err)
+			}
+			for _, action := range actions {
+				if err := c.waitForAction(ctx, action); err != nil {
+					return nil, err
+				}
+			}
+			firewall, _, err = c.cloud.Firewall.GetByID(ctx, firewall.ID)
+			if err != nil {
+				return nil, fmt.Errorf("refresh firewall %s: %w", name, err)
+			}
+			if firewall == nil {
+				return nil, fmt.Errorf("firewall %s disappeared after reconciliation", name)
+			}
 		}
-		rules = append(rules, hcloud.FirewallRule{
-			Direction: hcloud.FirewallRuleDirectionIn,
-			Protocol:  hcloud.FirewallRuleProtocolTCP,
-			Port:      &sshPort,
-			SourceIPs: sourceIPs,
-		})
+		return firewall, nil
 	}
 
 	result, _, err := c.cloud.Firewall.Create(ctx, hcloud.FirewallCreateOpts{
@@ -392,182 +374,52 @@ func (c *Client) EnsureFirewall(ctx context.Context, name string, sshCIDRs []str
 	return result.Firewall, nil
 }
 
-func (c *Client) EnsureLoadBalancer(ctx context.Context, name, loadBalancerType, location string, network *hcloud.Network) (*hcloud.LoadBalancer, error) {
-	loadBalancer, _, err := c.cloud.LoadBalancer.GetByName(ctx, strings.TrimSpace(name))
-	if err != nil {
-		return nil, fmt.Errorf("lookup load balancer %s: %w", name, err)
-	}
-	if loadBalancer != nil {
-		return loadBalancer, nil
-	}
-
-	listenPort := 6443
-	destPort := 6443
-	publicInterface := true
-	result, _, err := c.cloud.LoadBalancer.Create(ctx, hcloud.LoadBalancerCreateOpts{
-		Name:             strings.TrimSpace(name),
-		LoadBalancerType: &hcloud.LoadBalancerType{Name: strings.TrimSpace(loadBalancerType)},
-		Location:         &hcloud.Location{Name: strings.TrimSpace(location)},
-		PublicInterface:  &publicInterface,
-		Network:          network,
-		Services: []hcloud.LoadBalancerCreateOptsService{
-			{
-				Protocol:        hcloud.LoadBalancerServiceProtocolTCP,
-				ListenPort:      &listenPort,
-				DestinationPort: &destPort,
-			},
+func firewallRules(sshCIDRs []string) []hcloud.FirewallRule {
+	talosPort := "50000"
+	apiPort := "6443"
+	httpPort := "80"
+	httpsPort := "443"
+	rules := []hcloud.FirewallRule{
+		{
+			Direction: hcloud.FirewallRuleDirectionIn,
+			Protocol:  hcloud.FirewallRuleProtocolTCP,
+			Port:      &talosPort,
+			SourceIPs: []net.IPNet{mustIPNet("0.0.0.0/0")},
 		},
+		{
+			Direction: hcloud.FirewallRuleDirectionIn,
+			Protocol:  hcloud.FirewallRuleProtocolTCP,
+			Port:      &apiPort,
+			SourceIPs: []net.IPNet{mustIPNet("0.0.0.0/0")},
+		},
+		{
+			Direction: hcloud.FirewallRuleDirectionIn,
+			Protocol:  hcloud.FirewallRuleProtocolTCP,
+			Port:      &httpPort,
+			SourceIPs: []net.IPNet{mustIPNet("0.0.0.0/0")},
+		},
+		{
+			Direction: hcloud.FirewallRuleDirectionIn,
+			Protocol:  hcloud.FirewallRuleProtocolTCP,
+			Port:      &httpsPort,
+			SourceIPs: []net.IPNet{mustIPNet("0.0.0.0/0")},
+		},
+	}
+	if len(sshCIDRs) == 0 {
+		return rules
+	}
+
+	sshPort := "22"
+	sourceIPs := make([]net.IPNet, 0, len(sshCIDRs))
+	for _, cidr := range sshCIDRs {
+		sourceIPs = append(sourceIPs, mustIPNet(cidr))
+	}
+	return append(rules, hcloud.FirewallRule{
+		Direction: hcloud.FirewallRuleDirectionIn,
+		Protocol:  hcloud.FirewallRuleProtocolTCP,
+		Port:      &sshPort,
+		SourceIPs: sourceIPs,
 	})
-	if err != nil {
-		return nil, fmt.Errorf("create load balancer %s: %w", name, err)
-	}
-	if err := c.waitForAction(ctx, result.Action); err != nil {
-		return nil, err
-	}
-	return result.LoadBalancer, nil
-}
-
-func (c *Client) AddLoadBalancerTargets(ctx context.Context, loadBalancer *hcloud.LoadBalancer, servers []*hcloud.Server) error {
-	if loadBalancer == nil {
-		return fmt.Errorf("load balancer is required")
-	}
-	if len(servers) == 0 {
-		return nil
-	}
-
-	existing := map[int64]struct{}{}
-	for _, target := range loadBalancer.Targets {
-		if target.Server == nil || target.Server.Server == nil {
-			continue
-		}
-		existing[target.Server.Server.ID] = struct{}{}
-	}
-
-	usePrivateIP := true
-	for _, server := range servers {
-		if server == nil {
-			continue
-		}
-		if _, ok := existing[server.ID]; ok {
-			continue
-		}
-		action, _, err := c.cloud.LoadBalancer.AddServerTarget(ctx, loadBalancer, hcloud.LoadBalancerAddServerTargetOpts{
-			Server:       server,
-			UsePrivateIP: &usePrivateIP,
-		})
-		if err != nil {
-			return fmt.Errorf("add load balancer target %s -> %s: %w", loadBalancer.Name, server.Name, err)
-		}
-		if err := c.waitForAction(ctx, action); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *Client) SyncLoadBalancerTargetsByID(ctx context.Context, loadBalancerID int64, serverIDs []int64) error {
-	if loadBalancerID == 0 {
-		return fmt.Errorf("load balancer id is required")
-	}
-
-	loadBalancer, _, err := c.cloud.LoadBalancer.GetByID(ctx, loadBalancerID)
-	if err != nil {
-		return fmt.Errorf("lookup load balancer %d: %w", loadBalancerID, err)
-	}
-	if loadBalancer == nil {
-		return fmt.Errorf("load balancer %d not found", loadBalancerID)
-	}
-
-	desired := map[int64]struct{}{}
-	for _, serverID := range serverIDs {
-		if serverID > 0 {
-			desired[serverID] = struct{}{}
-		}
-	}
-
-	for _, target := range loadBalancer.Targets {
-		if target.LabelSelector == nil || strings.TrimSpace(target.LabelSelector.Selector) == "" {
-			continue
-		}
-		action, _, err := c.cloud.LoadBalancer.RemoveLabelSelectorTarget(ctx, loadBalancer, target.LabelSelector.Selector)
-		if err != nil {
-			return fmt.Errorf("remove load balancer label target %s -> %s: %w", loadBalancer.Name, target.LabelSelector.Selector, err)
-		}
-		if err := c.waitForAction(ctx, action); err != nil {
-			return err
-		}
-	}
-
-	existing := map[int64]struct{}{}
-	for _, target := range loadBalancer.Targets {
-		if target.Server == nil || target.Server.Server == nil {
-			continue
-		}
-		existing[target.Server.Server.ID] = struct{}{}
-	}
-
-	for serverID := range existing {
-		if _, ok := desired[serverID]; ok {
-			continue
-		}
-		action, _, err := c.cloud.LoadBalancer.RemoveServerTarget(ctx, loadBalancer, &hcloud.Server{ID: serverID})
-		if err != nil {
-			return fmt.Errorf("remove load balancer target %s -> %d: %w", loadBalancer.Name, serverID, err)
-		}
-		if err := c.waitForAction(ctx, action); err != nil {
-			return err
-		}
-	}
-
-	usePrivateIP := true
-	for serverID := range desired {
-		if _, ok := existing[serverID]; ok {
-			continue
-		}
-		server, _, err := c.cloud.Server.GetByID(ctx, serverID)
-		if err != nil {
-			return fmt.Errorf("lookup server %d for load balancer target: %w", serverID, err)
-		}
-		if server == nil {
-			return fmt.Errorf("server %d not found for load balancer target", serverID)
-		}
-		action, _, err := c.cloud.LoadBalancer.AddServerTarget(ctx, loadBalancer, hcloud.LoadBalancerAddServerTargetOpts{
-			Server:       server,
-			UsePrivateIP: &usePrivateIP,
-		})
-		if err != nil {
-			return fmt.Errorf("add load balancer target %s -> %s: %w", loadBalancer.Name, server.Name, err)
-		}
-		if err := c.waitForAction(ctx, action); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (c *Client) EnsureLoadBalancerLabelTarget(ctx context.Context, loadBalancer *hcloud.LoadBalancer, selector string) error {
-	if loadBalancer == nil {
-		return fmt.Errorf("load balancer is required")
-	}
-	selector = strings.TrimSpace(selector)
-	if selector == "" {
-		return fmt.Errorf("label selector is required")
-	}
-	for _, target := range loadBalancer.Targets {
-		if target.LabelSelector != nil && target.LabelSelector.Selector == selector {
-			return nil
-		}
-	}
-	usePrivateIP := true
-	action, _, err := c.cloud.LoadBalancer.AddLabelSelectorTarget(ctx, loadBalancer, hcloud.LoadBalancerAddLabelSelectorTargetOpts{
-		Selector:     selector,
-		UsePrivateIP: &usePrivateIP,
-	})
-	if err != nil {
-		return fmt.Errorf("add load balancer label target %s -> %s: %w", loadBalancer.Name, selector, err)
-	}
-	return c.waitForAction(ctx, action)
 }
 
 func (c *Client) CreateServer(ctx context.Context, req ServerCreateRequest) (*Server, error) {
@@ -644,6 +496,143 @@ func (c *Client) GetServerByID(ctx context.Context, id int64) (*Server, error) {
 		return nil, fmt.Errorf("server %d not found", id)
 	}
 	return fromHCloudServer(server), nil
+}
+
+func (c *Client) EnsureServerReverseDNS(ctx context.Context, serverID int64, ip, hostname string) error {
+	server, _, err := c.cloud.Server.GetByID(ctx, serverID)
+	if err != nil {
+		return fmt.Errorf("lookup server %d: %w", serverID, err)
+	}
+	if server == nil {
+		return fmt.Errorf("server %d not found", serverID)
+	}
+
+	ip = strings.TrimSpace(ip)
+	if parsed := net.ParseIP(ip); parsed == nil {
+		return fmt.Errorf("invalid server IP %q", ip)
+	}
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		return fmt.Errorf("reverse DNS hostname is required")
+	}
+
+	current, err := server.GetDNSPtrForIP(net.ParseIP(ip))
+	if err == nil && strings.TrimSpace(current) == hostname {
+		return nil
+	}
+
+	action, _, err := c.cloud.Server.ChangeDNSPtr(ctx, server, ip, &hostname)
+	if err != nil {
+		return fmt.Errorf("set reverse DNS for server %s (%s -> %s): %w", server.Name, ip, hostname, err)
+	}
+	return c.waitForAction(ctx, action)
+}
+
+func (c *Client) EnsureServerInPlacementGroup(ctx context.Context, serverID, placementGroupID int64) (*Server, error) {
+	server, _, err := c.cloud.Server.GetByID(ctx, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("lookup server %d: %w", serverID, err)
+	}
+	if server == nil {
+		return nil, fmt.Errorf("server %d not found", serverID)
+	}
+	if server.PlacementGroup != nil {
+		if server.PlacementGroup.ID == placementGroupID {
+			return fromHCloudServer(server), nil
+		}
+		return nil, fmt.Errorf("server %s is attached to placement group %d instead of %d", server.Name, server.PlacementGroup.ID, placementGroupID)
+	}
+	action, _, err := c.cloud.Server.AddToPlacementGroup(ctx, server, &hcloud.PlacementGroup{ID: placementGroupID})
+	if err != nil {
+		return nil, fmt.Errorf("add server %s to placement group %d: %w", server.Name, placementGroupID, err)
+	}
+	if err := c.waitForAction(ctx, action); err != nil {
+		return nil, err
+	}
+	refreshed, _, err := c.cloud.Server.GetByID(ctx, server.ID)
+	if err != nil {
+		return nil, fmt.Errorf("refresh server %s: %w", server.Name, err)
+	}
+	return fromHCloudServer(refreshed), nil
+}
+
+func (c *Client) EnsureServerAttachedToNetwork(ctx context.Context, serverID, networkID int64, privateIPv4 string) (*Server, error) {
+	server, _, err := c.cloud.Server.GetByID(ctx, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("lookup server %d: %w", serverID, err)
+	}
+	if server == nil {
+		return nil, fmt.Errorf("server %d not found", serverID)
+	}
+	wantIP := strings.TrimSpace(privateIPv4)
+	for _, privateNet := range server.PrivateNet {
+		if privateNet.Network == nil || privateNet.Network.ID != networkID {
+			continue
+		}
+		currentIP := ""
+		if privateNet.IP != nil {
+			currentIP = privateNet.IP.String()
+		}
+		if wantIP != "" && currentIP != wantIP {
+			return nil, fmt.Errorf("server %s has private IPv4 %s on network %d, expected %s", server.Name, currentIP, networkID, wantIP)
+		}
+		return fromHCloudServer(server), nil
+	}
+	if wantIP == "" {
+		return nil, fmt.Errorf("private IPv4 is required to attach server %s to network %d", server.Name, networkID)
+	}
+	action, _, err := c.cloud.Server.AttachToNetwork(ctx, server, hcloud.ServerAttachToNetworkOpts{
+		Network: &hcloud.Network{ID: networkID},
+		IP:      net.ParseIP(wantIP),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("attach server %s to network %d: %w", server.Name, networkID, err)
+	}
+	if err := c.waitForAction(ctx, action); err != nil {
+		return nil, err
+	}
+	refreshed, _, err := c.cloud.Server.GetByID(ctx, server.ID)
+	if err != nil {
+		return nil, fmt.Errorf("refresh server %s: %w", server.Name, err)
+	}
+	return fromHCloudServer(refreshed), nil
+}
+
+func (c *Client) EnsureFirewallAppliedToServer(ctx context.Context, firewallID, serverID int64) (*Server, error) {
+	server, _, err := c.cloud.Server.GetByID(ctx, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("lookup server %d: %w", serverID, err)
+	}
+	if server == nil {
+		return nil, fmt.Errorf("server %d not found", serverID)
+	}
+	for _, status := range server.PublicNet.Firewalls {
+		if status == nil {
+			continue
+		}
+		if status.Firewall.ID == firewallID {
+			return fromHCloudServer(server), nil
+		}
+	}
+	actions, _, err := c.cloud.Firewall.ApplyResources(ctx, &hcloud.Firewall{ID: firewallID}, []hcloud.FirewallResource{
+		{
+			Type:   hcloud.FirewallResourceTypeServer,
+			Server: &hcloud.FirewallResourceServer{ID: serverID},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("apply firewall %d to server %s: %w", firewallID, server.Name, err)
+	}
+	for _, action := range actions {
+		if err := c.waitForAction(ctx, action); err != nil {
+			return nil, err
+		}
+	}
+	refreshed, _, err := c.cloud.Server.GetByID(ctx, server.ID)
+	if err != nil {
+		return nil, fmt.Errorf("refresh server %s: %w", server.Name, err)
+	}
+	return fromHCloudServer(refreshed), nil
 }
 
 func (c *Client) ListServers(ctx context.Context, labels map[string]string) ([]Server, error) {
@@ -847,94 +836,6 @@ func (c *Client) GetFirewallByName(ctx context.Context, name string) (*Firewall,
 	return &Firewall{ID: firewall.ID, Name: firewall.Name}, nil
 }
 
-func (c *Client) GetLoadBalancerByName(ctx context.Context, name string) (*LoadBalancer, error) {
-	loadBalancer, _, err := c.cloud.LoadBalancer.GetByName(ctx, strings.TrimSpace(name))
-	if err != nil {
-		return nil, fmt.Errorf("lookup load balancer %s: %w", name, err)
-	}
-	if loadBalancer == nil {
-		return nil, nil
-	}
-	ipv4 := ""
-	if !loadBalancer.PublicNet.IPv4.IP.IsUnspecified() {
-		ipv4 = loadBalancer.PublicNet.IPv4.IP.String()
-	}
-	return &LoadBalancer{
-		ID:         loadBalancer.ID,
-		Name:       loadBalancer.Name,
-		PublicIPv4: ipv4,
-	}, nil
-}
-
-func (c *Client) LoadBalancerTargetsHealthy(ctx context.Context, loadBalancerID int64, serverIDs []int64, listenPort int) (bool, string, error) {
-	if loadBalancerID == 0 {
-		return false, "", fmt.Errorf("load balancer id is required")
-	}
-	loadBalancer, _, err := c.cloud.LoadBalancer.GetByID(ctx, loadBalancerID)
-	if err != nil {
-		return false, "", fmt.Errorf("lookup load balancer %d: %w", loadBalancerID, err)
-	}
-	if loadBalancer == nil {
-		return false, "", fmt.Errorf("load balancer %d not found", loadBalancerID)
-	}
-	ready, summary := evaluateLoadBalancerTargets(loadBalancer.Targets, serverIDs, listenPort)
-	return ready, summary, nil
-}
-
-func evaluateLoadBalancerTargets(targets []hcloud.LoadBalancerTarget, serverIDs []int64, listenPort int) (bool, string) {
-	desired := make([]int64, 0, len(serverIDs))
-	seenDesired := map[int64]struct{}{}
-	for _, serverID := range serverIDs {
-		if serverID <= 0 {
-			continue
-		}
-		if _, ok := seenDesired[serverID]; ok {
-			continue
-		}
-		seenDesired[serverID] = struct{}{}
-		desired = append(desired, serverID)
-	}
-	slices.Sort(desired)
-
-	byServerID := map[int64]hcloud.LoadBalancerTarget{}
-	for _, target := range targets {
-		if target.Server == nil || target.Server.Server == nil {
-			continue
-		}
-		byServerID[target.Server.Server.ID] = target
-	}
-
-	if len(desired) == 0 {
-		return true, "no targets required"
-	}
-
-	attached := 0
-	healthy := 0
-	statuses := make([]string, 0, len(desired))
-	for _, serverID := range desired {
-		target, ok := byServerID[serverID]
-		if !ok {
-			statuses = append(statuses, fmt.Sprintf("%d:missing", serverID))
-			continue
-		}
-		attached++
-		status := "unknown"
-		for _, health := range target.HealthStatus {
-			if health.ListenPort == listenPort {
-				status = string(health.Status)
-				break
-			}
-		}
-		if status == string(hcloud.LoadBalancerTargetHealthStatusStatusHealthy) {
-			healthy++
-		}
-		statuses = append(statuses, fmt.Sprintf("%d:%s", serverID, status))
-	}
-
-	ready := attached == len(desired) && healthy == len(desired)
-	return ready, fmt.Sprintf("attached=%d/%d healthy=%d/%d [%s]", attached, len(desired), healthy, len(desired), strings.Join(statuses, ", "))
-}
-
 func (c *Client) DeleteServer(ctx context.Context, id int64) error {
 	result, _, err := c.cloud.Server.DeleteWithResult(ctx, &hcloud.Server{ID: id})
 	if err != nil {
@@ -947,14 +848,6 @@ func (c *Client) DeleteServer(ctx context.Context, id int64) error {
 		return nil
 	}
 	return c.waitForAction(ctx, result.Action)
-}
-
-func (c *Client) DeleteLoadBalancer(ctx context.Context, id int64) error {
-	_, err := c.cloud.LoadBalancer.Delete(ctx, &hcloud.LoadBalancer{ID: id})
-	if err != nil && !isNotFound(err) {
-		return fmt.Errorf("delete load balancer %d: %w", id, err)
-	}
-	return nil
 }
 
 func (c *Client) DeleteNetwork(ctx context.Context, id int64) error {
@@ -1290,19 +1183,37 @@ func fromHCloudServer(server *hcloud.Server) *Server {
 	} else if server.Datacenter != nil && server.Datacenter.Location != nil {
 		out.Location = server.Datacenter.Location.Name
 	}
+	if server.Image != nil {
+		out.ImageID = server.Image.ID
+	}
+	if server.PlacementGroup != nil {
+		out.PlacementGroupID = server.PlacementGroup.ID
+	}
 	if !server.PublicNet.IPv4.IsUnspecified() {
 		out.PublicIPv4 = server.PublicNet.IPv4.IP.String()
 	}
 	if !server.PublicNet.IPv6.IsUnspecified() {
 		out.PublicIPv6 = server.PublicNet.IPv6.IP.String()
 	}
+	for _, status := range server.PublicNet.Firewalls {
+		if status == nil {
+			continue
+		}
+		out.FirewallIDs = append(out.FirewallIDs, status.Firewall.ID)
+	}
 	for _, privateNet := range server.PrivateNet {
+		if privateNet.Network != nil {
+			out.NetworkIDs = append(out.NetworkIDs, privateNet.Network.ID)
+		}
 		if privateNet.IP == nil {
 			continue
 		}
-		out.PrivateIPv4 = privateNet.IP.String()
-		break
+		if out.PrivateIPv4 == "" {
+			out.PrivateIPv4 = privateNet.IP.String()
+		}
 	}
+	out.FirewallIDs = uniqueInt64s(out.FirewallIDs)
+	out.NetworkIDs = uniqueInt64s(out.NetworkIDs)
 	return out
 }
 
@@ -1317,6 +1228,67 @@ func cloneLabels(labels map[string]string) map[string]string {
 	return cloned
 }
 
+func uniqueInt64s(values []int64) []int64 {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(values))
+	out := make([]int64, 0, len(values))
+	for _, value := range values {
+		if value == 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func firewallRulesEqual(actual, desired []hcloud.FirewallRule) bool {
+	return slices.Equal(normalizedFirewallRules(actual), normalizedFirewallRules(desired))
+}
+
+func normalizedFirewallRules(rules []hcloud.FirewallRule) []string {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, strings.Join([]string{
+			string(rule.Direction),
+			string(rule.Protocol),
+			strings.TrimSpace(derefString(rule.Port)),
+			strings.Join(normalizeIPNets(rule.SourceIPs), ","),
+			strings.Join(normalizeIPNets(rule.DestinationIPs), ","),
+		}, "|"))
+	}
+	slices.Sort(out)
+	return out
+}
+
+func normalizeIPNets(values []net.IPNet) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, value.String())
+	}
+	slices.Sort(out)
+	return out
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
 func matchesLabels(actual, expected map[string]string) bool {
 	if len(expected) == 0 {
 		return true
@@ -1327,23 +1299,6 @@ func matchesLabels(actual, expected map[string]string) bool {
 		}
 	}
 	return true
-}
-
-func buildLabelSelector(labels map[string]string) string {
-	if len(labels) == 0 {
-		return ""
-	}
-	selectors := make([]string, 0, len(labels))
-	for key, value := range labels {
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		if key == "" || value == "" {
-			continue
-		}
-		selectors = append(selectors, key+"="+value)
-	}
-	slices.Sort(selectors)
-	return strings.Join(selectors, ",")
 }
 
 func uniqueNonEmpty(values []string) []string {

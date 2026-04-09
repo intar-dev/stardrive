@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/intar-dev/stardrive/internal/cloudflare"
 	"github.com/intar-dev/stardrive/internal/config"
 	"github.com/intar-dev/stardrive/internal/hetzner"
 	"github.com/intar-dev/stardrive/internal/infisical"
@@ -23,7 +22,6 @@ var destroyPhases = []string{
 	"delete-dns",
 	"delete-servers",
 	"delete-image",
-	"delete-load-balancer",
 	"delete-firewall",
 	"delete-placement-group",
 	"delete-network",
@@ -99,18 +97,14 @@ func (a *App) Destroy(ctx context.Context, req DestroyRequest) error {
 		if strings.TrimSpace(infra.CloudflareToken) == "" {
 			return map[string]string{"skipped": "cloudflare token missing"}, nil
 		}
-		cfClient := cloudflare.New(infra.CloudflareToken)
-		if err := cfClient.DeleteARecords(ctx, cfg.DNS.Zone, cfg.DNS.APIHostname); err != nil {
+		if err := deleteClusterDNS(ctx, cfg, infra.CloudflareToken); err != nil {
 			return nil, err
 		}
-		if cfg.DNS.ManageNodeRecords {
-			for _, node := range cfg.Nodes {
-				if err := cfClient.DeleteARecords(ctx, cfg.DNS.Zone, nodeDNSName(cfg, node)); err != nil {
-					return nil, err
-				}
-			}
-		}
-		return map[string]string{"apiHostname": cfg.DNS.APIHostname}, nil
+		return map[string]string{
+			"apiHostname": cfg.DNS.APIHostname,
+			"appWildcard": cfg.AppWildcardHostname(),
+			"nodeRecords": fmt.Sprintf("%t", cfg.DNS.ManageNodeRecords),
+		}, nil
 	}); err != nil {
 		return err
 	}
@@ -177,28 +171,6 @@ func (a *App) Destroy(ctx context.Context, req DestroyRequest) error {
 			deleted = 1
 		}
 		return map[string]int{"deleted": deleted}, nil
-	}); err != nil {
-		return err
-	}
-
-	if err := a.runPhase(op, "delete-load-balancer", func() (any, error) {
-		loadBalancerID := runtimeState.LoadBalancerID
-		if loadBalancerID == 0 {
-			loadBalancer, err := hzClient.GetLoadBalancerByName(ctx, clusterResourceName(cfg, "api-lb"))
-			if err != nil {
-				return nil, err
-			}
-			if loadBalancer != nil {
-				loadBalancerID = loadBalancer.ID
-			}
-		}
-		if loadBalancerID == 0 {
-			return map[string]bool{"deleted": false}, nil
-		}
-		if err := hzClient.DeleteLoadBalancer(ctx, loadBalancerID); err != nil {
-			return nil, err
-		}
-		return map[string]any{"deleted": true, "id": loadBalancerID}, nil
 	}); err != nil {
 		return err
 	}
