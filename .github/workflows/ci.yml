@@ -1,5 +1,5 @@
 name: Validate
-run-name: Validate ${{ github.event_name == 'pull_request' && format('PR #{0}', github.event.pull_request.number) || github.ref_name }}
+run-name: "${{ github.event_name == 'pull_request' && format('Validate PR #{0}', github.event.pull_request.number) || format('Validate {0}', github.ref_name) }}"
 
 on:
   pull_request:
