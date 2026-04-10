@@ -1,4 +1,5 @@
-name: Cut Release
+name: Create Release
+run-name: Create ${{ inputs.bump }} release from ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
@@ -21,6 +22,7 @@ concurrency:
 
 jobs:
   tag:
+    name: Tag and publish release
     runs-on: ubuntu-latest
 
     steps:
