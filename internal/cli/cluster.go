@@ -154,7 +154,7 @@ func newClusterExecCommand(opts *rootOptions) *cobra.Command {
 
 	cmd.Flags().StringVar(&clusterName, "cluster", "", "Cluster name")
 	cmd.Flags().StringVarP(&cfgFile, "file", "f", "", "Path to cluster config YAML")
-	cmd.Flags().StringVar(&shell, "shell", "", "Shell to execute, defaults to $SHELL")
+	cmd.Flags().StringVar(&shell, "shell", "", "Shell to execute, defaults to the platform shell")
 	return cmd
 }
 

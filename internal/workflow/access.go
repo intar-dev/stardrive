@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/intar-dev/stardrive/internal/config"
 )
@@ -80,10 +79,7 @@ func (a *App) Exec(ctx context.Context, req ExecRequest) error {
 
 	shell := strings.TrimSpace(req.Shell)
 	if shell == "" {
-		shell = strings.TrimSpace(os.Getenv("SHELL"))
-	}
-	if shell == "" {
-		shell = "/bin/sh"
+		shell = defaultExecShell()
 	}
 
 	cmd := exec.CommandContext(ctx, shell)
@@ -94,7 +90,7 @@ func (a *App) Exec(ctx context.Context, req ExecRequest) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = commandSysProcAttr()
 
 	a.Printf("Opening shell for cluster %s\n", cfg.Cluster.Name)
 	return cmd.Run()
