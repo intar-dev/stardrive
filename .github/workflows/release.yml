@@ -107,3 +107,26 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew formula
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          git checkout -B main origin/main
+
+          ./scripts/update-homebrew-formula.sh \
+            --tag "${TAG}" \
+            --checksums "dist/stardrive_${TAG#v}_checksums.txt"
+
+          if git diff --quiet --exit-code -- Formula/stardrive.rb; then
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/stardrive.rb
+          git commit -m "chore(homebrew): update formula for ${TAG}"
+          git push origin HEAD:main
