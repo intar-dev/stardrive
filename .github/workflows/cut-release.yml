@@ -1,0 +1,92 @@
+name: Cut Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semantic version increment for the next release tag
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ensure the workflow runs from main
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "This workflow must be run from main, got ${GITHUB_REF_NAME}." >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Determine next release tag
+        id: next
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          latest_tag="$(git tag --list 'v*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
+
+          if [ -z "${latest_tag}" ]; then
+            next_tag="v0.1.0"
+          else
+            version="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<<"${version}"
+
+            case "${BUMP}" in
+              patch)
+                patch=$((patch + 1))
+                ;;
+              minor)
+                minor=$((minor + 1))
+                patch=0
+                ;;
+              major)
+                major=$((major + 1))
+                minor=0
+                patch=0
+                ;;
+              *)
+                echo "Unsupported bump: ${BUMP}" >&2
+                exit 1
+                ;;
+            esac
+
+            next_tag="v${major}.${minor}.${patch}"
+          fi
+
+          echo "tag=${next_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create annotated tag
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists." >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
