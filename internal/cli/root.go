@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/intar-dev/stardrive/internal/buildinfo"
 	"github.com/intar-dev/stardrive/internal/config"
 	"github.com/intar-dev/stardrive/internal/envfile"
 	"github.com/intar-dev/stardrive/internal/workflow"
@@ -26,12 +27,17 @@ func NewRootCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "stardrive",
 		Short:         "Manage Hetzner-hosted Talos clusters with Infisical-backed GitOps",
+		Version:       buildinfo.Report("stardrive"),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
 		},
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if shouldSkipEnvLoad(cmd) {
+				return nil
+			}
+
 			level := slog.LevelInfo
 			if opts.Verbose {
 				level = slog.LevelDebug
@@ -50,6 +56,7 @@ func NewRootCommand() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.SetVersionTemplate("{{printf \"%s\\n\" .Version}}")
 
 	wd, _ := os.Getwd()
 	cmd.PersistentFlags().StringVar(&opts.Paths.ClustersDir, "clusters-dir", filepath.Join(wd, "clusters"), "Directory containing cluster config YAML files")
@@ -62,6 +69,7 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddCommand(newUpgradeCommand(opts))
 	cmd.AddCommand(newEtcdCommand(opts))
 	cmd.AddCommand(newGitOpsCommand(opts))
+	cmd.AddCommand(newVersionCommand())
 
 	return cmd
 }
@@ -84,4 +92,13 @@ func resolveConfigPath(opts *rootOptions, clusterName, explicitFile string) (str
 	default:
 		return "", fmt.Errorf("either --cluster or --file is required")
 	}
+}
+
+func shouldSkipEnvLoad(cmd *cobra.Command) bool {
+	if cmd.Name() == "version" {
+		return true
+	}
+
+	versionFlag, err := cmd.Flags().GetBool("version")
+	return err == nil && versionFlag
 }
