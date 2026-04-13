@@ -1,29 +1,32 @@
 # Apps
 
-Public apps attach to the shared `Gateway` in `gateway-system` with `HTTPRoute`.
+Public apps should use the Cloudflare Tunnel ingress class.
 
 Constraints:
 - hostnames must be under your cluster base domain, for example `*.intar.app`
-- routes should bind to `stardrive-public`
-- HTTPS is terminated by the platform wildcard certificate
+- routes should set `ingressClassName: cloudflare-tunnel`
+- the controller reads `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_TUNNEL_NAME` from the shared Infisical operator path
+- the Cloudflare API token needs Zone read, DNS edit, and Cloudflare Tunnel edit permissions
 
 Example shape:
 
 ```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
+apiVersion: networking.k8s.io/v1
+kind: Ingress
 metadata:
   name: example
   namespace: app
 spec:
-  parentRefs:
-    - name: stardrive-public
-      namespace: gateway-system
-      sectionName: https
-  hostnames:
-    - app.intar.app
+  ingressClassName: cloudflare-tunnel
   rules:
-    - backendRefs:
-        - name: example
-          port: 8080
+    - host: app.intar.app
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: example
+                port:
+                  number: 8080
 ```

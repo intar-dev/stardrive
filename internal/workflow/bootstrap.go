@@ -142,8 +142,10 @@ func (a *App) Bootstrap(ctx context.Context, req BootstrapRequest) error {
 			return nil, err
 		}
 		if err := infClient.SetSecrets(ctx, cfg.Infisical.ProjectID, cfg.Infisical.Environment, paths.OperatorShared, map[string]string{
-			secretHetznerToken:       infra.Hetzner.Token,
-			secretCloudflareAPIToken: infra.CloudflareToken,
+			secretHetznerToken:         infra.Hetzner.Token,
+			secretCloudflareAPIToken:   infra.CloudflareToken,
+			secretCloudflareAccountID:  infra.CloudflareAccountID,
+			secretCloudflareTunnelName: infra.CloudflareTunnelName,
 		}); err != nil {
 			return nil, err
 		}
@@ -488,17 +490,20 @@ func (a *App) promptBootstrapInputs(ctx context.Context, cfg *config.Config, edi
 	}
 
 	existing, _ := infClient.GetSecrets(ctx, cfg.Infisical.ProjectID, cfg.Infisical.Environment, cfg.Secrets().OperatorShared)
-	infra := infraSecrets{
-		Hetzner: hetzner.Credentials{
-			Token: defaultSecret(existing[secretHetznerToken], os.Getenv(secretHetznerToken)),
-		},
-		CloudflareToken: defaultSecret(existing[secretCloudflareAPIToken], os.Getenv(secretCloudflareAPIToken)),
-	}
+	infra := infraSecretsFromValues(existing)
 	infra.Hetzner.Token, err = promptSecretIfNeeded(ctx, edit, infra.Hetzner.Token, "HCLOUD_TOKEN", "Hetzner Cloud project API token")
 	if err != nil {
 		return nil, infraSecrets{}, err
 	}
-	infra.CloudflareToken, err = promptSecretIfNeeded(ctx, edit, infra.CloudflareToken, "Cloudflare API token", "Token with DNS edit permissions for the target zone")
+	infra.CloudflareToken, err = promptSecretIfNeeded(ctx, edit, infra.CloudflareToken, "Cloudflare API token", "Token with Zone read, DNS edit, and Cloudflare Tunnel edit permissions")
+	if err != nil {
+		return nil, infraSecrets{}, err
+	}
+	infra.CloudflareAccountID, err = promptStringIfNeeded(ctx, edit, infra.CloudflareAccountID, "Cloudflare account ID", "Account that owns the tunnel and DNS zones")
+	if err != nil {
+		return nil, infraSecrets{}, err
+	}
+	infra.CloudflareTunnelName, err = promptStringIfNeeded(ctx, edit, infra.CloudflareTunnelName, "Cloudflare Tunnel name", "Tunnel to create or reuse for public app ingress")
 	if err != nil {
 		return nil, infraSecrets{}, err
 	}

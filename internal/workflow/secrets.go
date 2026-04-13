@@ -17,8 +17,10 @@ import (
 )
 
 const (
-	secretHetznerToken       = "HCLOUD_TOKEN"
-	secretCloudflareAPIToken = "CLOUDFLARE_API_TOKEN"
+	secretHetznerToken         = "HCLOUD_TOKEN"
+	secretCloudflareAPIToken   = "CLOUDFLARE_API_TOKEN"
+	secretCloudflareAccountID  = "CLOUDFLARE_ACCOUNT_ID"
+	secretCloudflareTunnelName = "CLOUDFLARE_TUNNEL_NAME"
 
 	secretStorageBoxID        = "STORAGE_BOX_ID"
 	secretStorageBoxName      = "STORAGE_BOX_NAME"
@@ -51,8 +53,10 @@ const (
 )
 
 type infraSecrets struct {
-	Hetzner         hetzner.Credentials
-	CloudflareToken string
+	Hetzner              hetzner.Credentials
+	CloudflareToken      string
+	CloudflareAccountID  string
+	CloudflareTunnelName string
 }
 
 type storageBoxSecrets struct {
@@ -108,14 +112,22 @@ func (a *App) loadInfraSecrets(ctx context.Context, cfg *config.Config) (infraSe
 		return infraSecrets{}, err
 	}
 
-	token := defaultSecret(values[secretHetznerToken], os.Getenv(secretHetznerToken))
-	if token == "" {
+	infra := infraSecretsFromValues(values)
+	if infra.Hetzner.Token == "" {
 		return infraSecrets{}, fmt.Errorf("Hetzner token is missing from Infisical path %s", cfg.Secrets().OperatorShared)
 	}
+	return infra, nil
+}
+
+func infraSecretsFromValues(values map[string]string) infraSecrets {
 	return infraSecrets{
-		Hetzner:         hetzner.Credentials{Token: token},
-		CloudflareToken: defaultSecret(values[secretCloudflareAPIToken], os.Getenv(secretCloudflareAPIToken)),
-	}, nil
+		Hetzner: hetzner.Credentials{
+			Token: defaultSecret(values[secretHetznerToken], os.Getenv(secretHetznerToken)),
+		},
+		CloudflareToken:      defaultSecret(values[secretCloudflareAPIToken], os.Getenv(secretCloudflareAPIToken)),
+		CloudflareAccountID:  defaultSecret(values[secretCloudflareAccountID], os.Getenv(secretCloudflareAccountID)),
+		CloudflareTunnelName: defaultSecret(values[secretCloudflareTunnelName], os.Getenv(secretCloudflareTunnelName)),
+	}
 }
 
 func (a *App) loadStorageBoxSecrets(ctx context.Context, cfg *config.Config) (storageBoxSecrets, error) {

@@ -718,7 +718,7 @@ func (a *App) waitForFluxBootstrapOCI(ctx context.Context, cfg *config.Config, k
 
 func (a *App) waitForDeferredFluxBootstrapOCI(ctx context.Context, cfg *config.Config, kubeconfigPath string) error {
 	env := a.kubectlEnv(kubeconfigPath)
-	for _, name := range []string{fluxIssuerKustomizationName, fluxClusterSecretsKustomizationName, fluxPublicEdgeKustomizationName, fluxAppsKustomizationName} {
+	for _, name := range []string{fluxIssuerKustomizationName, fluxClusterSecretsKustomizationName, fluxPublicEdgeKustomizationName, fluxCloudflareTunnelKustomizationName, fluxAppsKustomizationName} {
 		if err := a.runCommand(ctx, env, nil, "kubectl", "wait", "--namespace", fluxNamespace, "--for=condition=Ready", "kustomization/"+name, "--timeout=15m"); err != nil {
 			return err
 		}
@@ -1276,8 +1276,25 @@ spec:
   interval: 5m0s
   prune: true
   wait: true
+  path: "./core/cloudflare-tunnel-ingress-controller"
+  dependsOn:
+    - name: %s
+  sourceRef:
+    kind: OCIRepository
+    name: %s
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  interval: 5m0s
+  prune: true
+  wait: true
   path: "./apps"
   dependsOn:
+    - name: %s
     - name: %s
   sourceRef:
     kind: OCIRepository
@@ -1309,9 +1326,14 @@ spec:
 		fluxNamespace,
 		fluxIssuerKustomizationName,
 		fluxOCIRepositoryName,
+		fluxCloudflareTunnelKustomizationName,
+		fluxNamespace,
+		fluxKustomizationName,
+		fluxOCIRepositoryName,
 		fluxAppsKustomizationName,
 		fluxNamespace,
 		fluxPublicEdgeKustomizationName,
+		fluxCloudflareTunnelKustomizationName,
 		fluxOCIRepositoryName,
 	))
 }

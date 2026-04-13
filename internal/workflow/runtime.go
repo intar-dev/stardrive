@@ -28,16 +28,17 @@ import (
 )
 
 const (
-	fluxNamespace                       = "flux-system"
-	fluxOCIRepositoryName               = "stardrive"
-	fluxKustomizationName               = "stardrive"
-	fluxCertManagerKustomizationName    = "stardrive-cert-manager"
-	fluxIssuerKustomizationName         = "stardrive-cert-manager-issuer"
-	fluxPublicEdgeKustomizationName     = "stardrive-public-edge"
-	fluxClusterSecretsKustomizationName = "stardrive-cluster-secrets"
-	fluxAppsKustomizationName           = "stardrive-apps"
-	defaultCiliumCLIVersion             = "v0.19.2"
-	defaultORASCLIVersion               = "v1.3.0"
+	fluxNamespace                         = "flux-system"
+	fluxOCIRepositoryName                 = "stardrive"
+	fluxKustomizationName                 = "stardrive"
+	fluxCertManagerKustomizationName      = "stardrive-cert-manager"
+	fluxIssuerKustomizationName           = "stardrive-cert-manager-issuer"
+	fluxPublicEdgeKustomizationName       = "stardrive-public-edge"
+	fluxClusterSecretsKustomizationName   = "stardrive-cluster-secrets"
+	fluxCloudflareTunnelKustomizationName = "stardrive-cloudflare-tunnel"
+	fluxAppsKustomizationName             = "stardrive-apps"
+	defaultCiliumCLIVersion               = "v0.19.2"
+	defaultORASCLIVersion                 = "v1.3.0"
 )
 
 type clusterAccessSecrets struct {

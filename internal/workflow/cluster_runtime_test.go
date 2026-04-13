@@ -55,11 +55,13 @@ func TestFluxOCIBootstrapManifestStagesDependentKustomizations(t *testing.T) {
 		`path: "./core/cert-manager-issuer"`,
 		`path: "./core/cluster-secrets"`,
 		`path: "./core/public-edge"`,
+		`path: "./core/cloudflare-tunnel-ingress-controller"`,
 		`path: "./apps"`,
 		`- name: stardrive`,
 		`- name: stardrive-cert-manager`,
 		`- name: stardrive-cert-manager-issuer`,
 		`- name: stardrive-public-edge`,
+		`- name: stardrive-cloudflare-tunnel`,
 	} {
 		if !strings.Contains(manifest, needle) {
 			t.Fatalf("expected flux bootstrap manifest to contain %q, got:\n%s", needle, manifest)
